@@ -1,4 +1,4 @@
-# Alerts for the celery-worker-heavy OOM watchdog sidecar
+# Alerts for the heavy-worker OOM watchdog sidecar
 # (). The watchdog acts autonomously
 # (rollback/circuit-break within seconds); these alerts exist because the
 # conditions below need HUMAN action (add nodes, fix config, replace a dead
@@ -8,16 +8,16 @@
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
-  name: celery-watchdog-rules
+  name: memory-watchdog-rules
   labels:
     prometheus: kube-prometheus
     role: alert-rules
 spec:
   groups:
-    - name: celery-watchdog
+    - name: memory-watchdog
       interval: 1m
       rules:
-        - alert: CeleryWatchdogResizeFailed
+        - alert: MemoryWatchdogResizeFailed
           expr: increase(watchdog_resize_failed_total{namespace=~"myapp-.*"}[10m]) > 0
           for: 0m
           labels:
@@ -25,7 +25,7 @@ spec:
           annotations:
             summary: "Watchdog 原地扩容失败回滚（Infeasible/超时）!"
             description: "{{$labels.namespace}}/{{$labels.pod}} 的 resize 在 {{$labels.stage}} 阶段失败，spec 已自动回滚并熔断 10 分钟。通常为节点容量不足：请扩容节点或横向分流——Infeasible 不会触发节点自动扩容，必须人工处置。"
-        - alert: CeleryWatchdogHostMemoryExhausted
+        - alert: MemoryWatchdogHostMemoryExhausted
           expr: increase(watchdog_blocked_total{namespace=~"myapp-.*", reason="host_full"}[10m]) > 0
           for: 0m
           labels:
@@ -33,7 +33,7 @@ spec:
           annotations:
             summary: "Watchdog 宿主机内存枯竭，扩容熔断!"
             description: "{{$labels.namespace}}/{{$labels.pod}} 所在节点连最小步长都无法安全借出（90% 物理内存红线），扩容被拒绝以保护节点。请扩容节点或分流；期间该 pod 可能 OOM（设计内失败方向）。"
-        - alert: CeleryWatchdogSpecReadErrors
+        - alert: MemoryWatchdogSpecReadErrors
           expr: increase(watchdog_spec_read_errors_total{namespace=~"myapp-.*"}[10m]) > 0
           for: 0m
           labels:
@@ -41,7 +41,7 @@ spec:
           annotations:
             summary: "Watchdog 内存高压期间无法读取 pod spec!"
             description: "{{$labels.namespace}}/{{$labels.pod}} 在内存越过扩容水位时读取 pod spec 失败（API Server 不可达？），OOM 抢救处于失效状态。请检查 API Server 与节点网络。"
-        - alert: CeleryWatchdogScaleUpBlockedAtCap
+        - alert: MemoryWatchdogScaleUpBlockedAtCap
           expr: increase(watchdog_blocked_total{namespace=~"myapp-.*", reason="max_limit"}[15m]) > 0
           for: 0m
           labels:
@@ -49,7 +49,7 @@ spec:
           annotations:
             summary: "Watchdog 扩容达到租户配额上限（cap）"
             description: "{{$labels.namespace}}/{{$labels.pod}} 内存压力持续但 limit 已达 maxMemoryFactor x baseline 的上限。若为常态，评估上调该租户的 heavyResources.limits（baseline）或 maxMemoryFactor。"
-        - alert: CeleryWatchdogSidecarRestarting
+        - alert: MemoryWatchdogSidecarRestarting
           # The watchdog is a native sidecar (initContainer + restartPolicy
           # Always), so kube-state-metrics reports it under the
           # kube_pod_init_container_* family, NOT kube_pod_container_*.
@@ -60,7 +60,7 @@ spec:
           annotations:
             summary: "Watchdog sidecar 反复重启，heavy worker 失去弹性上探!"
             description: "{{$labels.namespace}}/{{$labels.pod}} 的 watchdog 容器 30 分钟内重启超过 2 次。期间 heavy worker 内存上限停留在 baseline，突发任务无 OOM 抢救。查看容器日志 CRITICAL 行；前提不满足时应关闭 watchdog.enabled。"
-        - alert: CeleryWatchdogSelfMemoryHigh
+        - alert: MemoryWatchdogSelfMemoryHigh
           # Absolute threshold on purpose: the limit is hardcoded to 100Mi in
           # deployment_h.yaml (not tenant-configurable), and as an init
           # container the watchdog has no kube_pod_container_resource_limits

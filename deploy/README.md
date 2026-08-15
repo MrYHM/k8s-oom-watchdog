@@ -6,7 +6,7 @@
 ## helm/
 
 Helm 模板而非可直接 apply 的清单——其中引用了源 chart 的模板助手
-（`app.celeryworker.fullname`、`app.namespace` 等）与 values 键，
+（`app.worker.fullname`、`app.namespace` 等）与 values 键，
 移植到你的 chart 时需替换这些引用。
 
 | 文件 | 作用 |
@@ -25,4 +25,4 @@ Terraform `templatefile` 渲染），直接使用时需自行替换：
 | 文件 | 作用 |
 |---|---|
 | `prometheus-rules.yaml` | 6 条 PrometheusRule：resize 失败、宿主机枯竭、spec 读取失败、到达 cap、sidecar 反复重启、自身内存贴线 |
-| `alertmanager-config.yaml` | AlertmanagerConfig：CeleryWatchdog.* 告警路由到 IM 告警通道（示例为 Opsgenie 风格 webhook） |
+| `alertmanager-config.yaml` | AlertmanagerConfig：MemoryWatchdog.* 告警路由到 IM 告警通道（示例为 Opsgenie 风格 webhook） |

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Memory stress tool for watchdog scale-up drills.
 
-Grows a real (page-touched) allocation inside the celery-worker-heavy container
+Grows a real (page-touched) allocation inside the heavy-worker container
 until the target size, holds it, then releases -- driving the working set
 through the watchdog's 80% watermark so the in-place resize path can be
 observed end to end.

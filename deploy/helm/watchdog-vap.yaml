@@ -1,23 +1,24 @@
-{{- if and .Values.celeryWorker.enabled .Values.celeryWorker.watchdog.enabled .Values.celeryWorker.watchdog.admissionGuard -}}
-{{- $watchdogSA := printf "system:serviceaccount:%s:%s-watchdog-sa" (.Values.namespace | required "Missing required namespace value") (include "app.celeryworker.fullname" .) -}}
+{{- if and .Values.worker.enabled .Values.worker.watchdog.enabled .Values.worker.watchdog.admissionGuard -}}
+{{- $target := .Values.worker.watchdog.targetContainer | default "heavy-worker" -}}
+{{- $watchdogSA := printf "system:serviceaccount:%s:%s-watchdog-sa" (.Values.namespace | required "Missing required namespace value") (include "app.worker.fullname" .) -}}
 # ValidatingAdmissionPolicy narrowing the watchdog SA's RBAC residual risk:
 # RBAC cannot express "only your own pod / only these fields", so the Role
 # grants pods+pods/resize patch namespace-wide. This policy pins every write
 # by the SA to exactly what the watchdog is designed to do:
-#   - only pods labelled name=celery-worker-heavy
+#   - only pods labelled name=<targetContainer>
 #   - labels immutable (a label change could re-route Service selectors)
 #   - annotations: only the two baseline keys may change
 #   - main-resource updates must not touch spec at all
-#   - resize updates may only change the celery-worker-heavy container's MEMORY
+#   - resize updates may only change the target container's MEMORY
 # Cluster-scoped objects: names carry the namespace so per-tenant releases
 # never collide; the binding scopes enforcement to this tenant namespace.
 # failurePolicy=Fail is safe here: matchConditions limit blast radius to the
 # watchdog SA itself -- worst case its resize is denied and the
-# CeleryWatchdogResizeFailed alert fires.
+# MemoryWatchdogResizeFailed alert fires.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: celery-watchdog-guard-{{ .Values.namespace | required "Missing required namespace value" }}
+  name: memory-watchdog-guard-{{ .Values.namespace | required "Missing required namespace value" }}
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -39,12 +40,12 @@ spec:
     - name: allowedAnn
       expression: "['oom-watchdog.io/baseline-memory', 'oom-watchdog.io/baseline-requests']"
     - name: newC
-      expression: "object.spec.containers.filter(c, c.name == 'celery-worker-heavy')"
+      expression: "object.spec.containers.filter(c, c.name == '{{ $target }}')"
     - name: oldC
-      expression: "oldObject.spec.containers.filter(c, c.name == 'celery-worker-heavy')"
+      expression: "oldObject.spec.containers.filter(c, c.name == '{{ $target }}')"
   validations:
-    - expression: "has(object.metadata.labels) && ('name' in object.metadata.labels) && object.metadata.labels['name'] == 'celery-worker-heavy'"
-      message: "watchdog SA may only modify pods labelled name=celery-worker-heavy"
+    - expression: "has(object.metadata.labels) && ('name' in object.metadata.labels) && object.metadata.labels['name'] == '{{ $target }}'"
+      message: "watchdog SA may only modify pods labelled name={{ $target }}"
       reason: Forbidden
     - expression: "(has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})"
       message: "watchdog SA must not change pod labels"
@@ -56,10 +57,10 @@ spec:
       message: "watchdog SA must not change pod spec outside the resize subresource"
       reason: Forbidden
     - expression: "!variables.isResize || (variables.newC.size() == 1 && variables.oldC.size() == 1)"
-      message: "resize target must contain exactly one celery-worker-heavy container"
+      message: "resize target must contain exactly one {{ $target }} container"
       reason: Forbidden
-    - expression: "!variables.isResize || object.spec.containers.all(c, c.name == 'celery-worker-heavy' || oldObject.spec.containers.filter(o, o.name == c.name)[0].resources == c.resources)"
-      message: "watchdog SA may only resize the celery-worker-heavy container"
+    - expression: "!variables.isResize || object.spec.containers.all(c, c.name == '{{ $target }}' || oldObject.spec.containers.filter(o, o.name == c.name)[0].resources == c.resources)"
+      message: "watchdog SA may only resize the {{ $target }} container"
       reason: Forbidden
     - expression: "!variables.isResize || (variables.newC[0].resources.?limits.?cpu.orValue('') == variables.oldC[0].resources.?limits.?cpu.orValue('') && variables.newC[0].resources.?requests.?cpu.orValue('') == variables.oldC[0].resources.?requests.?cpu.orValue(''))"
       message: "watchdog SA may only change memory, not cpu"
@@ -68,9 +69,9 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: celery-watchdog-guard-{{ .Values.namespace }}
+  name: memory-watchdog-guard-{{ .Values.namespace }}
 spec:
-  policyName: celery-watchdog-guard-{{ .Values.namespace }}
+  policyName: memory-watchdog-guard-{{ .Values.namespace }}
   validationActions: ["Deny"]
   matchResources:
     namespaceSelector:

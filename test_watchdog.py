@@ -25,7 +25,7 @@ from watchdog import (
     bytes_to_k8s_str,
     decide_scale_down,
     decide_scale_up,
-    find_celery_cgroup_dir,
+    find_target_cgroup_dir,
     find_pod_cgroup_dir,
     parse_memory_to_bytes,
     read_cgroup_memory,
@@ -249,21 +249,21 @@ class TestCgroupParsing(unittest.TestCase):
         self.assertIsNone(limit)
         self.assertEqual(working_set, 100)
 
-    def test_find_celery_cgroup_by_container_id(self):
+    def test_find_target_cgroup_by_container_id(self):
         self._write_container("cri-containerd-aaa111.scope", mem_max=16 * GIB)
         expected = self._write_container("cri-containerd-bbb222.scope", mem_max=200 * MIB)
-        found = find_celery_cgroup_dir(self.tmp, container_id="containerd://bbb222")
+        found = find_target_cgroup_dir(self.tmp, container_id="containerd://bbb222")
         self.assertEqual(found, expected)
 
-    def test_find_celery_cgroup_falls_back_to_size_heuristic(self):
+    def test_find_target_cgroup_falls_back_to_size_heuristic(self):
         self._write_container("cri-containerd-watchdog.scope", mem_max=200 * MIB)
-        expected = self._write_container("cri-containerd-celery.scope", mem_max=16 * GIB)
-        found = find_celery_cgroup_dir(self.tmp, container_id=None)
+        expected = self._write_container("cri-containerd-app.scope", mem_max=16 * GIB)
+        found = find_target_cgroup_dir(self.tmp, container_id=None)
         self.assertEqual(found, expected)
 
-    def test_find_celery_cgroup_returns_none_when_absent(self):
+    def test_find_target_cgroup_returns_none_when_absent(self):
         self._write_container("cri-containerd-watchdog.scope", mem_max=200 * MIB)
-        self.assertIsNone(find_celery_cgroup_dir(self.tmp))
+        self.assertIsNone(find_target_cgroup_dir(self.tmp))
 
 
 class TestFindPodCgroupDir(unittest.TestCase):
@@ -354,7 +354,7 @@ class FakeApi:
     def __init__(self, spec_limit: str = "2Gi", spec_requests: str = None):
         self.spec_limit = spec_limit
         self.spec_requests = spec_requests
-        self.container_id = "containerd://celery123"
+        self.container_id = "containerd://app123"
         self.resize_pending = (None, "")
         self.patches = []
         self.request_patches = []
@@ -410,7 +410,7 @@ def make_watchdog(read_fn, api=None, clock=None, host=(32 * GIB, 20 * GIB),
     wd = watchdog.Watchdog(
         make_cfg(**cfg_overrides), api, FakeNotifier(), watchdog.Metrics(),
         watchdog.Heartbeat(),
-        celery_dir="/fake/pod/celery.scope", pod_slice="/fake/pod",
+        target_dir="/fake/pod/app.scope", pod_slice="/fake/pod",
         baseline=baseline, baseline_requests=baseline_requests,
         current_requests=current_requests,
         fatal_fn=lambda msg: (_ for _ in ()).throw(SystemExit(msg)),
@@ -493,7 +493,7 @@ class TestWatchdogStateMachine(unittest.TestCase):
         self.assertGreater(wd.circuit_open_until, clock.now())
 
     def test_enoent_relocates_to_new_cgroup(self):
-        # The celery container restarted: its old scope is gone and a new one
+        # The target container restarted: its old scope is gone and a new one
         # exists; the watchdog must rebind within one tick instead of erroring
         # until the consecutive-failure limit restarts the sidecar.
         def read(path):
@@ -504,7 +504,7 @@ class TestWatchdogStateMachine(unittest.TestCase):
         wd, api, clock = make_watchdog(
             read, find_dir=lambda pod_slice, cid=None: "/fake/pod/new.scope")
         wd.tick()  # relocates
-        self.assertEqual(wd.celery_dir, "/fake/pod/new.scope")
+        self.assertEqual(wd.target_dir, "/fake/pod/new.scope")
         self.assertIn(("CgroupRelocated", "Normal"), api.events)
         clock.advance(0.1)
         wd.tick()  # now reads the new scope without raising
@@ -881,7 +881,7 @@ class TestPodApiEvents(unittest.TestCase):
         # silently disappears -- exactly what happened on the first live
         # cluster. Guard the exact prefix rule here.
         import re
-        gen = self._emit("celery-worker-heavy-7c58d9445-ddm29")["metadata"]["generateName"]
+        gen = self._emit("heavy-worker-7c58d9445-ddm29")["metadata"]["generateName"]
         candidate = gen[:-1] + "a" if gen.endswith("-") else gen
         pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
         self.assertRegex(candidate, pattern,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Celery OOM in-place vertical scaling watchdog sidecar.
+"""In-place vertical scaling OOM watchdog sidecar.
 
-Runs next to the celery-worker-heavy container, samples its cgroup v2 memory
+Runs next to the heavy-worker container, samples its cgroup v2 memory
 working set at high frequency and uses the Kubernetes in-place pod resize
 subresource (K8s >= 1.33 / EKS >= 1.34) to raise the container memory limit
 before the kernel OOM-killer fires, then lowers it back once the burst is
@@ -58,7 +58,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("watchdog")
 
-TARGET_CONTAINER = "celery-worker-heavy"
+# Name of the container this sidecar supervises. Set per deployment;
+# the watchdog is workload-agnostic (Celery heavy workers were merely
+# the original use case).
+TARGET_CONTAINER = os.environ.get("WATCHDOG_TARGET_CONTAINER", "main")
 BASELINE_ANNOTATION = "oom-watchdog.io/baseline-memory"
 BASELINE_REQUESTS_ANNOTATION = "oom-watchdog.io/baseline-requests"
 HOST_CGROUP_ROOT = "/host/sys/fs/cgroup"
@@ -318,7 +321,7 @@ def read_cgroup_memory(cgroup_dir: str) -> Tuple[int, Optional[int]]:
 
     Working set excludes ``inactive_file`` (reclaimable page cache), matching
     the kubelet's OOM accounting. Raw ``memory.current`` would count file
-    cache and cause spurious scale-ups for IO-heavy Celery tasks.
+    cache and cause spurious scale-ups for IO-heavy tasks.
     """
     with open(os.path.join(cgroup_dir, "memory.current"), "r") as f:
         current = int(f.read().strip())
@@ -389,7 +392,7 @@ def find_pod_cgroup_dir(pod_uid: Optional[str], host_root: str = HOST_CGROUP_ROO
     return None
 
 
-def find_celery_cgroup_dir(
+def find_target_cgroup_dir(
     pod_slice_abs: str,
     container_id: Optional[str] = None,
     min_limit_bytes: int = 500 * MIB,
@@ -596,7 +599,7 @@ class PodApi:
             "note": message[:1000],
             "type": event_type,
             "regarding": regarding,
-            "reportingController": "oom-watchdog.io/celery-oom-watchdog",
+            "reportingController": "oom-watchdog.io/k8s-oom-watchdog",
             "reportingInstance": self.pod_name[:128],
         }
         try:
@@ -844,21 +847,21 @@ class Watchdog:
     BLOCKED_PATH_SLEEP = 10.0     # back-off while a scale-up stays blocked
 
     def __init__(self, cfg: Config, api: PodApi, notifier: FeishuNotifier,
-                 metrics: Metrics, heartbeat: Heartbeat, celery_dir: str,
+                 metrics: Metrics, heartbeat: Heartbeat, target_dir: str,
                  pod_slice: str, baseline: int, fatal_fn, *,
                  baseline_requests: Optional[str] = None,
                  current_requests: Optional[str] = None,
                  now_fn=time.monotonic, sleep_fn=time.sleep,
                  read_cgroup=read_cgroup_memory,
                  host_stats=get_host_memory_stats,
-                 find_container_dir=find_celery_cgroup_dir,
+                 find_container_dir=find_target_cgroup_dir,
                  jitter_fn=None) -> None:
         self.cfg = cfg
         self.api = api
         self.notifier = notifier
         self.metrics = metrics
         self.heartbeat = heartbeat
-        self.celery_dir = celery_dir
+        self.target_dir = target_dir
         self.pod_slice = pod_slice
         self.baseline = baseline
         # Original requests to restore when the limit returns to baseline.
@@ -932,7 +935,7 @@ class Watchdog:
                 self._fatal(
                     "The pod resize subresource is not available on this cluster "
                     "(requires Kubernetes >= 1.33 / EKS >= 1.34). Disable "
-                    "celeryWorker.watchdog or upgrade the cluster."
+                    "worker.watchdog or upgrade the cluster."
                 )
             action = "缩容" if is_down else "扩容"
             logger.error("Resize PATCH rejected (status %s): %s", e.status, e.body)
@@ -1012,11 +1015,11 @@ class Watchdog:
         except Exception as e:
             logger.warning("Could not refresh container ID during cgroup relocation: %s", e)
         new_dir = self._find_container_dir(self.pod_slice, container_id)
-        if not new_dir or new_dir == self.celery_dir:
+        if not new_dir or new_dir == self.target_dir:
             return False
         logger.warning("Target container cgroup moved (container restarted?): %s -> %s",
-                       self.celery_dir, new_dir)
-        self.celery_dir = new_dir
+                       self.target_dir, new_dir)
+        self.target_dir = new_dir
         self.metrics.inc("watchdog_cgroup_relocated_total")
         self.api.emit_event(
             "CgroupRelocated",
@@ -1035,7 +1038,7 @@ class Watchdog:
         self.heartbeat.beat()
 
         try:
-            working_set, cgroup_max = self._read_cgroup(self.celery_dir)
+            working_set, cgroup_max = self._read_cgroup(self.target_dir)
         except FileNotFoundError:
             if self._relocate_cgroup():
                 return  # rebound; observe fresh state next tick
@@ -1222,7 +1225,7 @@ class Watchdog:
         # pointless Infeasible round-trips.
         self._sleep(self._jitter())
         host_total, host_available = self._host_stats()
-        fresh_ws, fresh_max = self._read_cgroup(self.celery_dir)
+        fresh_ws, fresh_max = self._read_cgroup(self.target_dir)
         recheck = decide_scale_up(
             Sample(fresh_ws, fresh_max or cgroup_max, self.spec_limit, self.baseline,
                    host_total, host_available),
@@ -1393,7 +1396,7 @@ def main() -> None:
               f"{cfg.metrics_port}: {e}")
 
     logger.info("=" * 70)
-    logger.info("Starting Celery OOM watchdog sidecar (limits-only in-place resize).")
+    logger.info("Starting OOM watchdog sidecar (limits-only in-place resize).")
     logger.info("Target pod: %s | namespace: %s | uid: %s", pod_name, pod_namespace, pod_uid)
     logger.info(
         "Config - threshold: %.0f%%, interval: %.2fs, step: %s, cap: %g x baseline, "
@@ -1432,9 +1435,9 @@ def main() -> None:
         logger.warning("Could not read container ID from pod status yet: %s", e)
 
     # As a native sidecar the watchdog starts before the main container even
-    # exists; on a fresh node pulling the celery image alone can take minutes,
+    # exists; on a fresh node pulling the main image alone can take minutes,
     # so wait generously (heartbeat.beat() keeps the liveness probe green).
-    celery_dir = None
+    target_dir = None
     for attempt in range(1, 301):
         heartbeat.beat()
         if not container_id and attempt % 5 == 0:
@@ -1442,17 +1445,17 @@ def main() -> None:
                 container_id = api.get_container_id(api.get_pod())
             except Exception as e:
                 logger.debug("Container ID still unavailable: %s", e)
-        celery_dir = find_celery_cgroup_dir(pod_slice, container_id)
-        if celery_dir:
+        target_dir = find_target_cgroup_dir(pod_slice, container_id)
+        if target_dir:
             break
         if attempt == 1 or attempt % 10 == 0:
             logger.info("[%d/300] Waiting for %s container cgroup to initialize...",
                         attempt, TARGET_CONTAINER)
         time.sleep(1)
-    if not celery_dir:
+    if not target_dir:
         fatal(f"Could not locate the {TARGET_CONTAINER} cgroup directory after 300 seconds.")
         return
-    logger.info("Monitoring %s cgroup: %s", TARGET_CONTAINER, celery_dir)
+    logger.info("Monitoring %s cgroup: %s", TARGET_CONTAINER, target_dir)
 
     # Baseline limit AND baseline requests: persisted in pod annotations so a
     # watchdog restart after a resize does not adopt the inflated limit (or
@@ -1506,7 +1509,7 @@ def main() -> None:
 
     watchdog_loop = Watchdog(
         cfg, api, notifier, metrics, heartbeat,
-        celery_dir=celery_dir, pod_slice=pod_slice, baseline=baseline,
+        target_dir=target_dir, pod_slice=pod_slice, baseline=baseline,
         baseline_requests=baseline_req_str,
         current_requests=current_req_str,
         fatal_fn=fatal,

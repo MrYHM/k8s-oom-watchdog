@@ -1,16 +1,16 @@
-# Routing for the celery-worker-heavy OOM watchdog alerts (rules in
+# Routing for the heavy-worker OOM watchdog alerts (rules in
 # deploy/monitoring/prometheus-rules.yaml). Delivered through an Opsgenie-style
 # lambda to the Feishu group "your-alert-channel" (the lambda resolves the
 # chat_id from the group NAME, so the bot must be a member of that group).
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: AlertmanagerConfig
 metadata:
-  name: celery-watchdog-alerts
+  name: memory-watchdog-alerts
   labels:
     alertmanagerConfig: "true"
 spec:
   receivers:
-    - name: celery-watchdog-alerts
+    - name: memory-watchdog-alerts
       opsgenieConfigs:
         - sendResolved: false
           apiKey:
@@ -27,7 +27,7 @@ spec:
             - key: useful_link_url
               value: "{{ (index .Alerts 0).GeneratorURL }}"
             - key: alert_category
-              value: "celery_watchdog"
+              value: "memory_watchdog"
             - key: alert_source
               value: "Alertmanager"
             - key: to_mattermost
@@ -43,10 +43,10 @@ spec:
             - key: feishu_channel
               value: "your-alert-channel"
   route:
-    receiver: celery-watchdog-alerts
+    receiver: memory-watchdog-alerts
     matchers:
       - name: alertname
         matchType: "=~"
-        value: "CeleryWatchdog.*"
+        value: "MemoryWatchdog.*"
     groupBy: ['alertname', 'namespace']
     repeatInterval: 6h
