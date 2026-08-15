@@ -1,0 +1,55 @@
+# Example values: the celeryWorker.watchdog block + the heavy worker spread
+# constraint, adapted from a production chart.
+celeryWorker:
+  ## Spread heavy workers across nodes (soft): co-located heavy worker pods
+  ## compete for the same host-memory headroom when the watchdog borrows,
+  ## and a node failure takes out fewer long-running heavy tasks. Dedicated
+  ## key for celery-worker-heavy only; the shared celeryWorker.
+  ## topologySpreadConstraints below still feeds the other celery deployments.
+  heavyTopologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          name: celery-worker-heavy
+
+  ## In-place vertical scaling watchdog sidecar for celery-worker-heavy.
+  ## Requires Kubernetes >= 1.33 (EKS >= 1.34). See
+  ## README.md for behavior and limitations.
+  ## The container starts at heavyResources.limits.memory (= the watchdog's
+  ## baseline); the scale-up cap is maxMemoryFactor x that baseline.
+  watchdog:
+    enabled: false
+    threshold: 0.8
+    pollInterval: 0.1
+    memoryStep: "2Gi"
+    ## Scale-up cap = maxMemoryFactor x the pod's own baseline limit
+    ## (heavyResources.limits.memory), so one chart-wide value adapts to
+    ## every tenant's limits tier: a 4Gi tenant caps at 8Gi, a 16Gi tenant
+    ## at 32Gi. Must be > 1.0 (values <= 1 leave the watchdog unable to act).
+    ## There is no absolute cap; the host ceiling (formula 2) and kubelet
+    ## allocatable admission bound actual borrowing at runtime.
+    maxMemoryFactor: 2.0
+    ## Host physical-memory red line (formula 2): a scale-up is allowed only
+    ## while "new limit + everything else on the host" stays below this
+    ## fraction of physical memory.
+    hostCeiling: 0.90
+    ## Allow a half-step scale-up even when /host/proc/meminfo is unreadable
+    ## (the safety invariant cannot be evaluated). Keep off unless a broken
+    ## meminfo mount must be ridden out temporarily.
+    allowBlindScaleup: false
+    ## Port for the /metrics + /healthz endpoint (liveness probe target).
+    metricsPort: 8090
+    repository: "registry.example.com/memory-watchdog"
+    tag: "v1.8"
+    ## Create a headless Service + ServiceMonitor so Prometheus scrapes
+    ## :8090/metrics. Requires the prometheus-operator CRDs; disable otherwise.
+    ## Alerting is handled by the monitoring stack (PrometheusRule celery-watchdog-rules
+    ## + AlertmanagerConfig celery-watchdog-alerts), not by the sidecar itself.
+    serviceMonitor: true
+    ## ValidatingAdmissionPolicy pinning the watchdog SA's writes to
+    ## celery-worker-heavy pods only (labels immutable, two baseline annotations,
+    ## memory-only resize). Requires K8s >= 1.30 (VAP GA); our clusters are
+    ## 1.34. Disable only if the cluster rejects the API.
+    admissionGuard: true

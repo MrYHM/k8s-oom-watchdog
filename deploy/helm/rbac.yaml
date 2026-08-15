@@ -1,0 +1,43 @@
+{{- if and .Values.celeryWorker.enabled .Values.celeryWorker.watchdog.enabled -}}
+# Watchdog sidecar RBAC. RBAC cannot scope patch to "own pod only", so this
+# Role allows resize-patching any pod in the namespace. Two mitigations:
+# the token is exposed only to the watchdog container (projected volume,
+# automountServiceAccountToken=false on the pod), and watchdog-vap.yaml pins
+# every write by this SA to celery-worker-heavy pods / baseline annotations /
+# memory-only resizes via ValidatingAdmissionPolicy.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ template "app.celeryworker.fullname" . }}-watchdog-sa
+  {{ include "app.namespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ template "app.celeryworker.fullname" . }}-watchdog-role
+  {{ include "app.namespace" . }}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/resize"]
+  verbs: ["get", "patch"]
+# Resize history as pod events (visible in `kubectl describe pod`); the
+# watchdog writes them through events.k8s.io/v1 (core v1 Events are
+# deprecated).
+- apiGroups: ["events.k8s.io"]
+  resources: ["events"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ template "app.celeryworker.fullname" . }}-watchdog-rb
+  {{ include "app.namespace" . }}
+subjects:
+- kind: ServiceAccount
+  name: {{ template "app.celeryworker.fullname" . }}-watchdog-sa
+  namespace: {{ .Values.namespace | required "Missing required namespace value" }}
+roleRef:
+  kind: Role
+  name: {{ template "app.celeryworker.fullname" . }}-watchdog-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

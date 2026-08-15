@@ -1,0 +1,238 @@
+{{- if .Values.celeryWorker.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+{{- if .Values.celeryWorker.deploymentAnnotations }}
+  annotations:
+    {{ toYaml .Values.celeryWorker.deploymentAnnotations | nindent 4 }}
+{{- end }}
+  labels:
+    name: celery-worker
+    component: celery
+    tenant: {{ .Values.tenant }}
+  name: celery-worker-heavy
+  {{ include "app.namespace" . }}
+spec:
+  replicas: {{ .Values.celeryWorker.replicaCountHeavy }}
+  minReadySeconds: 20
+  {{- with .Values.common.rollStrategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      name: celery-worker-heavy
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        {{- toYaml .Values.celeryWorker.podAnnotations | nindent 8 }}
+      labels:
+        name: celery-worker-heavy
+        component: celery
+    spec:
+      {{- if .Values.celeryWorker.watchdog.enabled }}
+      serviceAccountName: {{ template "app.celeryworker.fullname" . }}-watchdog-sa
+      # The SA token grants pods/resize patch; it must not leak into the main
+      # celery container, so automount is off and a projected token volume is
+      # mounted into the watchdog sidecar only.
+      automountServiceAccountToken: false
+      {{- end }}
+      {{- with .Values.celeryWorker.heavyTopologySpreadConstraints }}
+      # Heavy workers get a dedicated spread key (chart-level default): with
+      # the watchdog enabled, co-located heavy worker pods compete for the same
+      # host-memory headroom, so spreading them is part of the borrow design.
+      topologySpreadConstraints:
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - args:
+        - celery-worker
+        - heavy
+        envFrom:
+          - secretRef:
+              name:  {{ template "app.secret.fullname" . }}
+        image: {{ .Values.common.appRepository }}:{{ .Values.common.appTag }}
+        imagePullPolicy: IfNotPresent
+        name: celery-worker-heavy
+        resizePolicy:
+        - resourceName: "memory"
+          restartPolicy: "NotRequired"
+        - resourceName: "cpu"
+          restartPolicy: "NotRequired"
+        resources:
+          {{ toYaml .Values.celeryWorker.heavyResources | nindent 12 }}
+        volumeMounts:
+        - mountPath: /app/code/
+          name: app-code-vol
+        - mountPath: /tmp/
+          name: heavy-temp-vol
+        {{- if .Values.common.certKeys }}
+        - mountPath: /app/certs
+          name: cert-files
+          readOnly: true
+        {{- end }}
+      initContainers:
+      - command:
+        {{ toYaml .Values.common.initContainersCommand | nindent 10 }}
+        env:
+        - name: APP_CODE_REMOTE
+          valueFrom:
+            secretKeyRef:
+              key: ps-code
+              name: {{ template "app.secret.fullname" . }}
+              optional: true
+        image: {{ .Values.common.awscliImage }}
+        imagePullPolicy: IfNotPresent
+        name: load-app-code
+        volumeMounts:
+        - mountPath: /app/code/
+          name: app-code-vol
+      {{- if .Values.celeryWorker.watchdog.enabled }}
+      # Native sidecar (restartPolicy: Always): guaranteed to start before the
+      # main container and to be terminated after it, so the whole celery
+      # lifecycle -- including the long terminationGracePeriodSeconds drain --
+      # stays under watchdog supervision. Listed after load-app-code so it
+      # starts right before the main container.
+      - name: watchdog
+        image: "{{ .Values.celeryWorker.watchdog.repository }}:{{ .Values.celeryWorker.watchdog.tag }}"
+        imagePullPolicy: IfNotPresent
+        restartPolicy: Always
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: WATCHDOG_THRESHOLD
+          value: "{{ .Values.celeryWorker.watchdog.threshold | default 0.8 }}"
+        - name: WATCHDOG_INTERVAL
+          value: "{{ .Values.celeryWorker.watchdog.pollInterval | default 0.1 }}"
+        - name: WATCHDOG_STEP
+          value: "{{ .Values.celeryWorker.watchdog.memoryStep | default "2Gi" }}"
+        # Scale-up cap = factor x the pod's own baseline limit, adapting to
+        # each tenant's limits tier. There is no absolute cap; runtime
+        # borrowing is bounded by the host ceiling + kubelet admission.
+        - name: WATCHDOG_MAX_FACTOR
+          value: "{{ .Values.celeryWorker.watchdog.maxMemoryFactor | default 2.0 }}"
+        - name: WATCHDOG_HOST_CEILING
+          value: "{{ .Values.celeryWorker.watchdog.hostCeiling | default 0.90 }}"
+        - name: WATCHDOG_ALLOW_BLIND_SCALEUP
+          value: "{{ .Values.celeryWorker.watchdog.allowBlindScaleup | default false }}"
+        - name: WATCHDOG_METRICS_PORT
+          value: "{{ .Values.celeryWorker.watchdog.metricsPort | default 8090 }}"
+        ports:
+        - name: metrics
+          containerPort: {{ .Values.celeryWorker.watchdog.metricsPort | default 8090 }}
+        # /healthz is fed by the main-loop heartbeat: it goes 503 when the
+        # loop stalls, even though the HTTP thread itself is still alive.
+        # Liveness only, no readinessProbe: a native sidecar's readiness
+        # gates the whole pod's Ready condition, and a watchdog restart must
+        # not mark heavy worker itself unready.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: metrics
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        # Pure-Python process over read-only hostPath mounts: nothing here
+        # needs a writable root FS, capabilities or a custom seccomp profile.
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        resources:
+          limits:
+            cpu: 100m
+            memory: 100Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        volumeMounts:
+        - mountPath: /host/sys/fs/cgroup
+          name: host-cgroup
+          readOnly: true
+        - mountPath: /host/proc/meminfo
+          name: host-proc-meminfo
+          readOnly: true
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: watchdog-sa-token
+          readOnly: true
+      {{- end }}
+      {{- with .Values.celeryWorker.heavyNodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.celeryWorker.affinity }}
+      affinity:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+      schedulerName: {{ .Values.common.schedulerName }}
+      terminationGracePeriodSeconds: {{ .Values.celeryWorker.terminationGracePeriodSeconds | default 21600 }}
+      volumes:
+      - emptyDir: {}
+        name: app-code-vol
+      - name: heavy-temp-vol
+        ephemeral:
+          volumeClaimTemplate:
+            metadata:
+              labels:
+                type: heavy-temp-volume
+            spec:
+              accessModes: [ "ReadWriteOnce" ]
+              storageClassName: {{ .Values.celeryWorker.heavyTempSC }}
+              resources:
+                requests:
+                  storage: {{ .Values.celeryWorker.heavyStorage }}
+      {{- if .Values.common.certKeys }}
+      - name: cert-files
+        secret:
+          secretName: {{ template "app.secret.fullname" . }}
+          items:
+          {{- range .Values.common.certKeys }}
+          - key: {{ .name }}
+            path: {{ .filename }}
+          {{- end }}
+      {{- end }}
+      {{- if .Values.celeryWorker.watchdog.enabled }}
+      - name: host-cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
+      - name: host-proc-meminfo
+        hostPath:
+          path: /proc/meminfo
+          type: File
+      - name: watchdog-sa-token
+        projected:
+          defaultMode: 420
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3607
+          - configMap:
+              name: kube-root-ca.crt
+              items:
+              - key: ca.crt
+                path: ca.crt
+          - downwardAPI:
+              items:
+              - path: namespace
+                fieldRef:
+                  fieldPath: metadata.namespace
+      {{- end }}
+{{- end -}}

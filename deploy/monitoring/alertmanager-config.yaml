@@ -1,0 +1,52 @@
+# Routing for the celery-worker-heavy OOM watchdog alerts (rules in
+# deploy/monitoring/prometheus-rules.yaml). Delivered through an Opsgenie-style
+# lambda to the Feishu group "your-alert-channel" (the lambda resolves the
+# chat_id from the group NAME, so the bot must be a member of that group).
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: celery-watchdog-alerts
+  labels:
+    alertmanagerConfig: "true"
+spec:
+  receivers:
+    - name: celery-watchdog-alerts
+      opsgenieConfigs:
+        - sendResolved: false
+          apiKey:
+            key: OPSGENIE_API_KEY
+            name: opsgenie-key
+          message: '{{ (index .Alerts 0).Annotations.summary }}'
+          description: '{{ (index .Alerts 0).Annotations.description }}'
+          priority: "P3"
+          details:
+            - key: environment
+              value: "${environment}"
+            - key: namespace
+              value: "{{ (index .Alerts 0).Labels.namespace }}"
+            - key: useful_link_url
+              value: "{{ (index .Alerts 0).GeneratorURL }}"
+            - key: alert_category
+              value: "celery_watchdog"
+            - key: alert_source
+              value: "Alertmanager"
+            - key: to_mattermost
+              value: "NO"
+            - key: mattermost_channel
+              value: ""
+            - key: to_wecom
+              value: "NO"
+            - key: wecom_webhook
+              value: ""
+            - key: to_feishu
+              value: "YES"
+            - key: feishu_channel
+              value: "your-alert-channel"
+  route:
+    receiver: celery-watchdog-alerts
+    matchers:
+      - name: alertname
+        matchType: "=~"
+        value: "CeleryWatchdog.*"
+    groupBy: ['alertname', 'namespace']
+    repeatInterval: 6h

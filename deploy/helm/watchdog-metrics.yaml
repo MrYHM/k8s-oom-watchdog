@@ -1,0 +1,44 @@
+{{- if and .Values.celeryWorker.enabled .Values.celeryWorker.watchdog.enabled .Values.celeryWorker.watchdog.serviceMonitor -}}
+# Headless Service + ServiceMonitor for the watchdog sidecar metrics.
+# Assumes the Prometheus is configured with
+# serviceMonitorSelectorNilUsesHelmValues=false and an empty namespace
+# selector, so this is picked up automatically in any tenant namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: celery-worker-heavy-watchdog-metrics
+  {{ include "app.namespace" . }}
+  labels:
+    name: celery-worker-heavy-watchdog-metrics
+    component: celery
+    tenant: {{ .Values.tenant }}
+spec:
+  clusterIP: None
+  selector:
+    name: celery-worker-heavy
+  ports:
+  - name: metrics
+    port: {{ .Values.celeryWorker.watchdog.metricsPort | default 8090 }}
+    # Numeric on purpose: the watchdog is a native sidecar (initContainer),
+    # and numeric targetPorts don't depend on named-port resolution across
+    # sidecar containers.
+    targetPort: {{ .Values.celeryWorker.watchdog.metricsPort | default 8090 }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: celery-worker-heavy-watchdog
+  {{ include "app.namespace" . }}
+  labels:
+    name: celery-worker-heavy-watchdog
+    tenant: {{ .Values.tenant }}
+spec:
+  endpoints:
+  - interval: 1m
+    path: /metrics
+    port: metrics
+    scheme: http
+  selector:
+    matchLabels:
+      name: celery-worker-heavy-watchdog-metrics
+{{- end }}
