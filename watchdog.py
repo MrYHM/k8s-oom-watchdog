@@ -15,7 +15,7 @@ Design decisions (see README.md for rationale):
   the headroom, and when node allocatable is insufficient the kubelet marks
   the resize Infeasible -- the pod may OOM but the host and its neighbours
   stay safe, which is the preferred failure direction. The host-ceiling
-  check (formula 2) guards against *actual usage* overcommit on top of that.
+  check guards against *actual usage* overcommit on top of that.
 - All decision logic lives in pure functions (``decide_scale_up`` /
   ``decide_scale_down``) operating on a ``Sample`` snapshot, and the control
   loop itself is the ``Watchdog`` class whose clock/API/filesystem access all
@@ -222,7 +222,7 @@ class Decision:
 def decide_scale_up(s: Sample, cfg: Config) -> Decision:
     """Decide whether (and how far) to raise the memory limit.
 
-    Host safety invariant (formula 2): new_limit + memory used by everything
+    Host safety invariant: new_limit + memory used by everything
     else on the host must stay below host_ceiling * host_total, i.e. even if
     the container consumes its whole new limit the host cannot be driven into
     global OOM by this decision alone.

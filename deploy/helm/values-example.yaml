@@ -30,10 +30,10 @@ worker:
     ## (heavyResources.limits.memory), so one chart-wide value adapts to
     ## every tenant's limits tier: a 4Gi tenant caps at 8Gi, a 16Gi tenant
     ## at 32Gi. Must be > 1.0 (values <= 1 leave the watchdog unable to act).
-    ## There is no absolute cap; the host ceiling (formula 2) and kubelet
+    ## There is no absolute cap; the host ceiling and kubelet
     ## allocatable admission bound actual borrowing at runtime.
     maxMemoryFactor: 2.0
-    ## Host physical-memory red line (formula 2): a scale-up is allowed only
+    ## Host physical-memory red line: a scale-up is allowed only
     ## while "new limit + everything else on the host" stays below this
     ## fraction of physical memory.
     hostCeiling: 0.90
