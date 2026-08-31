@@ -1,0 +1,133 @@
+# k8s-oom-watchdog — In-Place Pod Resize Memory Watchdog Sidecar for Kubernetes
+
+[English](README.en.md) | [简体中文](README.md)
+
+A **workload-agnostic** container memory watchdog sidecar for any long-running, memory-bursty workload (batch jobs, data imports, report aggregation, Celery/RQ workers, ETL tasks, …): it samples the target container's cgroup v2 **working-set memory** at high frequency and, before the kernel OOM-killer fires, raises the memory limit via Kubernetes **in-place pod resize** (the `/resize` subresource), then shrinks it back once the burst is over — without ever restarting the container or interrupting long-running tasks.
+
+Which container to supervise is set by the `WATCHDOG_TARGET_CONTAINER` environment variable (chart parameter `targetContainer`), fully decoupled from the business stack. This document and the example templates use `heavy-worker` (a Celery heavy worker, the project's original use case) as the target container.
+
+## Prerequisites
+
+| Condition | Requirement | Behavior when unmet |
+|---|---|---|
+| Kubernetes version | **≥ 1.33** (EKS ≥ 1.34); both the `/resize` subresource and native sidecars (initContainer with `restartPolicy: Always`) are GA | On the first PATCH returning 404/405 the watchdog logs an explicit CRITICAL message and exits; repeated restarts fire the `MemoryWatchdogSidecarRestarting` alert |
+| Cgroup | v2 (systemd driver; the EKS AL2023 default) | Fails to locate the cgroup at startup and exits |
+| Pod Security | The namespace must allow read-only hostPath mounts (`/sys/fs/cgroup`, `/proc/meminfo`); the PSA `restricted` profile rejects them | Pod cannot be created |
+| Alerting (monitoring stack) | Carried entirely by the monitoring stack: `deploy/monitoring/prometheus-rules.yaml` (6 PrometheusRules) + `deploy/monitoring/alertmanager-config.yaml` (delivered to your IM alert channel via an alert gateway; example channel name `your-alert-channel`), rolled out with the monitoring stack | Without the rules you only get metrics and K8s events, no active alerting — confirm the rules are deployed before enabling the watchdog |
+
+## How it works
+
+1. **Locating the cgroup**: parses `/proc/self/mountinfo` first — this only works in the **host cgroup namespace** (the root field carries host-absolute paths); in a **private cgroup namespace** (the EKS default) the root field is rendered relatively (its own mount as `/`, hostPath mounts as `/../..` chains), which the watchdog detects and automatically falls back to a **POD_UID glob** (~0.3s measured, executed once at startup). The main container's directory is **matched precisely via the containerID from pod status**; the ">500Mi limit" heuristic is only a fallback. If the main container restarts at runtime (the cgroup scope directory changes with the containerID), the watchdog **relocates automatically on the next sampling cycle and keeps monitoring** (metric `watchdog_cgroup_relocated_total`, event `CgroupRelocated`) instead of going blind for long.
+2. **Working-set accounting**: reads `memory.current` every 100ms and **subtracts `inactive_file` from `memory.stat`** (reclaimable page cache) — the same accounting the kubelet uses for OOM decisions — so IO-heavy tasks don't trigger spurious scale-ups from inflated cache.
+3. **Scale-up (working set ≥ 80% of limit)**: PATCHes the `/resize` subresource by one step (default 2Gi, truncated at the cap), raising **requests and limits together** — borrowed memory is always visible to scheduler/kubelet accounting: no new pod can be scheduled into that headroom, and when node allocatable is insufficient the kubelet marks the resize `Infeasible`, handled by the failure state machine. The failure direction is "the target container doesn't get the memory (the pod may OOM)" while **the host and neighbor pods always stay safe**.
+4. **Host safety red line (the host-ceiling check)**: a scale-up is allowed only while `new limit + everything else on the host < 90% × physical memory`; when space is short the step **degrades adaptively** (512Mi granularity — borrow whatever is available); when there is no space at all it trips a circuit breaker and alerts. Each PATCH is preceded by a **re-check with random jitter** to shrink the race window between multiple watchdogs on the same node.
+5. **Failure handling**: after a PATCH the watchdog supervises the pod's `PodResizePending` condition — `Infeasible`, or 60s without taking effect → **roll the spec back to the actually-effective values** + high-severity alert + a 10-minute scale-up circuit breaker. It never waits forever. On rollback, requests are **intentionally kept equal to limits** (the pod genuinely occupies that much memory right now; honest requests put it last in eviction ordering); once the working set falls back below the low-water mark and passes the scale-down debounce, the scale-down path issues a requests-only restoration (event `RequestsRestored`, metric `watchdog_requests_restored_total`), returning the scheduling headroom.
+6. **Scale-down**: working set < 40% × **current limit**, stable for 180s (and ≥ 180s since the last scale-up) → fall back to `max(baseline, 2 × working set)` (stepwise, not all at once). Together with the 80% scale-up line this forms a wide hysteresis band — no oscillation. Before a scale-down PATCH the watchdog **refreshes the pod spec** — if an external resize is in flight it switches to supervising it instead of overwriting; if the working set crosses the 80% mark again while a scale-down PATCH is in flight, the scale-down is **withdrawn immediately** (the current effective values are written back; event `ScaleDownWithdrawn`) so the next cycle can scale up normally — OOM rescue is never locked out by a pending state. The scale-up path is handled symmetrically: if the refreshed spec is lower than the current effective limit (its own pre-restart scale-down still in flight, or an external actor shrank the spec), the watchdog **adopts and supervises it first instead of computing a scale-up from the low value** — otherwise the computed "scale-up" target could be below the current effective limit, i.e. a scale-down under pressure; after adoption, the withdrawal logic completes the rescue on the next cycle. All PATCH target values are **normalized to 1Mi alignment**, so decimal quantities (e.g. `1500M`) can't leave the kernel-effective value permanently unequal to the supervision target and trigger spurious timeout rollbacks.
+7. **Baseline persistence**: on first startup the initial limit and initial requests are written to the pod annotations `oom-watchdog.io/baseline-memory` / `oom-watchdog.io/baseline-requests`; after a sidecar restart they are recovered from the annotations, so a scaled-up value is never mistaken for the baseline. When scale-down returns to the baseline, the initial requests are restored as well (borrowing over, scheduling headroom returned).
+8. **Failing loudly**: when host memory information is unreadable the watchdog **refuses to scale up and alerts continuously at high severity** (never silently skips); after 100 consecutive main-loop exceptions it exits and lets the kubelet restart it. `WATCHDOG_ALLOW_BLIND_SCALEUP=true` explicitly permits a "blind half-step scale-up".
+9. **Native sidecar form**: the watchdog is injected as a native sidecar (initContainer with `restartPolicy: Always`, ordered after load-app-code) — guaranteed to start before and terminate after the main container, so the main container's entire lifecycle (including graceful shutdown periods as long as 6h via `terminationGracePeriodSeconds`) is under supervision; its own crashes are restarted independently by the kubelet under the Always policy without affecting the main container. Because the main container may not exist yet when the sidecar starts (pulling the main image on a fresh node can take minutes), the startup wait window for the main container's cgroup is 300s, during which the heartbeat keeps liveness passing. The container runs with minimal privileges: non-root, read-only root filesystem, all capabilities dropped, RuntimeDefault seccomp.
+10. **Observability**: `:8090/metrics` exposes Prometheus metrics (`watchdog_scale_up_total`, `watchdog_blocked_total{reason}`, `watchdog_working_set_bytes`, …); the chart also creates a headless Service + ServiceMonitor (`watchdog.serviceMonitor: true`, on by default) so the monitoring stack's Prometheus scrapes them automatically. Every scale trigger/effect/failure/block is emitted as a **K8s Event** on the pod (visible directly in `kubectl describe pod`; same-type events deduplicated for 60s). `:8090/healthz` is driven by the main-loop heartbeat (returns 503 after 30s without a beat); the liveness probe targets it, so a stuck main loop is restarted by the kubelet. **Alerting is carried by the monitoring stack** (PrometheusRule `memory-watchdog-rules`, 6 rules: resize failure, host exhaustion, spec read failure, cap reached, sidecar restarting, own memory near limit; Alertmanager → alert gateway → IM alert channel) — the watchdog only *acts* (second-level closed-loop handling) and emits data points; it does not notify by itself, and the "the alarm itself died" blind spot is covered by external observation. The Feishu notifier retained in the code is a historical leftover; the chart no longer injects credentials, so it is permanently silent.
+
+## Known limitations
+
+- **The rescue window has a physical upper bound (allocation-rate limit)**: available rescue headroom = `(1 - threshold) × current limit` (default 20%; 3.2Gi at a 16Gi baseline), while the full rescue path takes: sampling period (≤ 0.1s) + PATCH RTT (~0.1–0.5s) + kubelet actually applying the resize (typically 1–5s, longer on busy nodes). **A burst whose sustained allocation rate exceeds "headroom ÷ path latency" (roughly ≥ 1GiB/s at a 16Gi baseline) will still OOM before the scale-up takes effect** — an inherent bound of the in-place resize mechanism, not a configuration problem. For known bursty tasks, lower `threshold` (earlier triggering) or raise the baseline (requests) directly, rather than expecting the watchdog to outrun arbitrary allocation rates.
+- **Same-node multi-watchdog race**: each pod's watchdog performs the host-ceiling check independently, and in the extreme they may request scale-ups simultaneously. Because requests are raised in lockstep, **the kubelet's allocatable admission is the authoritative, serialized second gate** — the race's consequence degrades from "host overcommit" to "the later resize is marked Deferred/Infeasible and rolled back". The 90% host red line still defends against scenarios allocatable accounting can't cover (e.g. neighbor pods using more than their requests). Additional mitigations: the jittered re-check before PATCH; the chart ships a soft per-node spread constraint for heavy workers by default (`worker.heavyTopologySpreadConstraints`, maxSkew 1 / `ScheduleAnyway`), reducing the chance of multiple heavy pods competing for the same node's headroom in the first place.
+- **RBAC granularity**: a Role cannot express "may only modify itself", so the watchdog SA can nominally patch any pod in the namespace. Two mitigations: ① the SA token is mounted only into the watchdog container via a projected volume (pod-level `automountServiceAccountToken: false`); ② the chart ships a **ValidatingAdmissionPolicy** (`watchdog-vap.yaml`, toggle `watchdog.admissionGuard`, on by default) so out-of-scope requests are denied directly by the API server. `failurePolicy: Fail` (fail-closed) is safe here: matchConditions scope the policy to this SA only, and the worst case of a policy outage is a rejected resize plus the `MemoryWatchdogResizeFailed` alert. The seven checks and the abuse vector each one blocks:
+
+  | # | Check | Abuse vector blocked |
+  |---|---|---|
+  | 1 | Target pod must carry the `name=heavy-worker` label | Resizing / annotating neighbor pods in the namespace |
+  | 2 | Labels are immutable, field by field | Tampering with labels to pull a pod out of / push it into a Service selector (traffic hijack/removal) |
+  | 3 | Only the two baseline annotation keys may be added/changed; no other key may be changed or deleted | Tampering with arbitrary pod metadata |
+  | 4 | On main-resource UPDATE, `spec` must be entirely unchanged | Using a `pods` patch to change mutable spec fields such as the image |
+  | 5 | A resize request must contain exactly one heavy-worker container | Malformed requests bypassing the later container-level checks |
+  | 6 | In a resize, only the heavy-worker container's resources may change | Shrinking other containers in the pod (e.g. the watchdog itself) to engineer a targeted OOM |
+  | 7 | heavy-worker's CPU requests/limits are immutable | Adjusting CPU without authorization (the watchdog is only entitled to memory) |
+- **Infeasible probability**: raising requests consumes node allocatable, so on tight nodes scale-up requests get rejected by the kubelet (Infeasible) — the by-design failure direction (the target container may OOM; the host stays safe). The watchdog automatically rolls back the spec, alerts, and breaks the circuit for 10 minutes. Frequent occurrences mean node capacity is genuinely short: add nodes or spread the load.
+- **Does not trigger node autoscaling**: Infeasible produces no Pending pods, so cluster-autoscaler / Karpenter will **not** scale nodes because of it. Node capacity shortage only surfaces as sustained Infeasible / host circuit-breaker alerts; you must add nodes or shard horizontally yourself.
+- **Image is arm64-only**: the base image uses an arch-specific arm64 tag, matching the ARM node groups the heavy workers run on. The base image itself is a multi-arch official image; for amd64 just adjust `--platform` in the build command (see the Dockerfile comment).
+- **Sidecar down = no elastic headroom**: the main container starts exactly at `heavyResources` (initial limits = baseline); the watchdog's job is to borrow the limit up to `maxMemoryFactor × baseline` during bursts. If the sidecar is persistently unavailable (cluster version unmet, broken hostPath mount, CrashLoop), the heavy worker's memory ceiling **stays at the baseline** (same as not enabling the watchdog — never lower), but bursty tasks lose OOM rescue. The corresponding alerts ship with the monitoring stack: `MemoryWatchdogSidecarRestarting` (restart rate), `MemoryWatchdogResizeFailed`, `MemoryWatchdogHostMemoryExhausted`, `MemoryWatchdogSpecReadErrors`, etc. — 6 rules in `deploy/monitoring/prometheus-rules.yaml`.
+- **Requests are temporarily raised while borrowing**: a resize writes requests and limits to the same value (borrowed memory must enter scheduling accounting — the first gate of host safety); **when falling back to the baseline, the initial requests are restored automatically** (the initial value persists in the `oom-watchdog.io/baseline-requests` annotation), so the scheduling headroom of an overcommitted shape (requests << limits) is fully returned once borrowing ends. Only intermediate stepwise scale-down levels (still above baseline, i.e. still borrowing) keep requests = limits. **A failed-scale-up rollback is a special level**: the limit returns to baseline but requests stay raised (honestly reflecting real usage); even with the limit at baseline the scale-down check keeps running — once the working set stays below the 40% mark and passes the 180s debounce, a requests-only restoration is issued automatically; a sidecar restart doesn't lose this bookkeeping either (at startup it compares the pod spec against the annotations and knows requests are still raised). Note: when upgrading the sidecar on pre-existing pods **without** the baseline-requests annotation, the watchdog treats the requests in the spec at that moment (possibly already raised by an earlier version) as the initial value — recreating the pod resets it.
+- **The main container no longer mounts an SA token**: enabling the watchdog sets `automountServiceAccountToken: false` at the pod level (the token is mounted only into the watchdog container via a projected volume). The business code currently makes no K8s API calls; re-evaluate if such a dependency is ever introduced.
+- **The watchdog's own memory profile and exec discipline**: the sidecar sits at ~70Mi resident (mostly the Python + kubernetes-client import footprint) and **does not grow with the target container's memory scale or with time**; a 100Mi limit has comfortable headroom in practice. However, **never exec a diagnostic script that imports the kubernetes package inside the watchdog container** — a second interpreter eats another 60–80Mi and instantly blows the container's limit (OOMKilled). For in-container diagnostics use lightweight stdlib-only scripts, or just read logs/metrics. A self-memory alert is in place (`MemoryWatchdogSelfMemoryHigh`: working set / limit > 90% for 10 minutes).
+
+## Deployment parameters (`values.yaml`)
+
+```yaml
+worker:
+  watchdog:
+    enabled: false           # off by default; verify the cluster meets the prerequisites first
+    threshold: 0.8           # scale-up watermark (working set / limit)
+    pollInterval: 0.1        # sampling period (seconds)
+    memoryStep: "2Gi"        # scale-up step
+    maxMemoryFactor: 2.0     # cap = this factor × baseline (auto-adapts per tenant); must be > 1.0
+    hostCeiling: 0.90        # host physical-memory red line (the host-ceiling check)
+    allowBlindScaleup: false # allow a blind half-step scale-up when host memory info is unreadable
+    metricsPort: 8090        # port for /metrics and /healthz
+    repository: "registry.example.com/memory-watchdog"
+    tag: "v1.8"
+```
+
+Alerting is not configured in the chart — it is rolled out by the monitoring stack (see the Prerequisites table).
+
+The scale-up cap has **exactly one mode**: `cap = maxMemoryFactor × baseline` (baseline = `heavyResources.limits.memory` at deploy time; the main container starts at it unchanged; default factor 2.0). One chart-wide value auto-adapts to tenants of different sizes (a 4Gi tier caps at 8Gi, a 16Gi tier at 32Gi); tenants needing a different cap just override the factor in their values. An absolute cap is deliberately **not** provided — how much can actually be borrowed at runtime is bounded by the host red line and the kubelet's allocatable admission. `maxMemoryFactor ≤ 1` is clamped to 1 (cap = baseline, the watchdog cannot act; surfaced via the `BLOCKED_MAX_LIMIT` alert).
+
+## Build & publish
+
+Push the image to your private registry, arm64:
+
+```bash
+docker buildx build --platform linux/arm64 \
+  -t registry.example.com/memory-watchdog:<tag> \
+  --push .
+```
+
+The image pip-installs a pinned `kubernetes` client (the resize-subresource methods require ≥ 33; older versions fall back to the raw-API path).
+
+## Stress drill
+
+The stress tool ships with this repo (`trigger_oom_test.py`); copy it into the `heavy-worker` container and run it (target 24G, grow 100M every 1s, hold 30s, then release):
+
+```bash
+kubectl cp trigger_oom_test.py \
+  <namespace>/<pod-name>:/tmp/trigger_oom_test.py -c heavy-worker
+kubectl exec -it <pod-name> -c heavy-worker -n <namespace> -- \
+  python3 /tmp/trigger_oom_test.py 24 100 1 30
+```
+
+Note: if the business image's Python is not on exec's PATH (e.g. a uv-managed venv), use the interpreter's full path.
+
+The default allocation rate (100MiB/s) is far below the rescue window's physical upper bound (see the first Known limitation), so it validates the normal path. To probe limit behavior, raise the rate toward the bound (e.g. `24 2048 0.5 30` ≈ 4GiB/s) — OOMing before the scale-up lands is then a by-design outcome in some scenarios, not a defect.
+
+Watch from another terminal:
+
+```bash
+kubectl logs -f <pod-name> -c watchdog -n <namespace>
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.status.conditions}'  # resize conditions
+curl <pod-ip>:8090/metrics                                                    # metrics
+```
+
+## Failure-mode handling
+
+| Symptom | Meaning | Action |
+|---|---|---|
+| Alert `MemoryWatchdogResizeFailed` | Node capacity short; kubelet rejected (Infeasible) or the resize timed out unapplied | Add nodes or shard the load; the watchdog has already rolled back the spec and broken the circuit for 10 minutes |
+| CRITICAL log "watchdog lost host visibility" (metric `watchdog_blocked_total{reason="no_host_stats"}`) | `/host/proc/meminfo` mount is broken | Check the hostPath mount and node health; no scale-up is performed in this state |
+| Alert `MemoryWatchdogHostMemoryExhausted` | The node as a whole is congested; no safe headroom | Add nodes; this is by-design protection |
+| Alert `MemoryWatchdogScaleUpBlockedAtCap` | Memory pressure persists but the cap (factor × baseline) is reached | If chronic, raise that tenant's baseline or maxMemoryFactor |
+| Alert `MemoryWatchdogSidecarRestarting` | Sidecar restarting repeatedly (prerequisites unmet / port taken / persistent main-loop errors / own OOM) | Read the container log's CRITICAL lines; meanwhile the heavy worker's ceiling stays at baseline with no OOM rescue |
+| Alert `MemoryWatchdogSpecReadErrors` | API server unreachable; scale decisions blocked | Check the API server / network; OOM rescue cannot run in this state |
+| Alert `MemoryWatchdogSelfMemoryHigh` | The watchdog's own memory is near its 100Mi limit | Check whether someone exec'ed a heavyweight diagnostic process; if a package upgrade raised the baseline, lift the limit to 128Mi |
+| The watchdog container itself OOMKilled (see the `last_terminated_reason` metric) | ~70Mi resident is a constant, so an OOMKill almost always means someone exec'ed a heavyweight diagnostic process, or a dependency upgrade raised the baseline | Check for in-container exec of kubernetes-importing scripts (forbidden); if a package upgrade raised the baseline, lift the limit to 128Mi and re-check the memory curve |
+
+## Unit tests
+
+The tests import the production module directly (no cluster, no kubernetes package needed) and cover unit conversion, scale decisions (host-ceiling blocking, adaptive degradation, the blind-scale-up switch, hysteresis anti-oscillation), cgroup parsing and container location, plus the **main-loop state machine** (pending supervision, Infeasible/timeout rollback, circuit breaking, scale-down withdrawal, cgroup relocation, external-resize adoption — driving the `Watchdog` class through injected fake clock/API/file readers):
+
+```bash
+python3 test_watchdog.py
+```
+
+## License
+
+[Apache License 2.0](LICENSE)

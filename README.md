@@ -1,5 +1,7 @@
 # k8s-oom-watchdog — Kubernetes 原地垂直扩缩容内存看门狗 Sidecar
 
+[English](README.en.md) | [简体中文](README.md)
+
 **通用**的容器内存看门狗 Sidecar，适用于任何长周期、内存尖刺型的工作负载（批处理、数据导入、报表聚合、Celery/RQ worker、ETL 任务等）：高频采样目标容器的 cgroup v2 **工作集内存**，在内核 OOM-kill 之前，通过 Kubernetes **原地垂直扩缩容（In-Place Pod Resize，`/resize` 子资源）** 抬高内存上限，任务结束后自动缩回，全程不重启容器、不打断长周期任务。
 
 监督哪个容器由 `WATCHDOG_TARGET_CONTAINER` 环境变量指定（chart 参数 `targetContainer`），与业务技术栈完全解耦——本文与示例模板以 `heavy-worker`（一个 Celery heavy worker，本项目的起源场景）作为目标容器示例。
