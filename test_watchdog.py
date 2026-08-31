@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 HY
+# SPDX-License-Identifier: Apache-2.0
 """Offline unit tests for the watchdog sidecar.
 
 Imports the real production module (no kubernetes package or cluster needed:

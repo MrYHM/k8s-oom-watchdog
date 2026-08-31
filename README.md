@@ -125,3 +125,7 @@ curl <pod-ip>:8090/metrics                                                    # 
 ```bash
 python3 test_watchdog.py
 ```
+
+## License
+
+[Apache License 2.0](LICENSE)

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 HY
+# SPDX-License-Identifier: Apache-2.0
 """In-place vertical scaling OOM watchdog sidecar.
 
 Runs next to the heavy-worker container, samples its cgroup v2 memory

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 HY
+# SPDX-License-Identifier: Apache-2.0
 """Memory stress tool for watchdog scale-up drills.
 
 Grows a real (page-touched) allocation inside the heavy-worker container
