@@ -1,0 +1,83 @@
+# Builds and publishes the watchdog image to GitHub Container Registry.
+#
+#   push a v* tag  -> ghcr.io/<owner>/k8s-oom-watchdog:1.2.3, :1.2, :latest
+#   push to master -> :edge
+#   pull request   -> build only (multi-arch, never pushed)
+#
+# The unit tests gate every publish: they need no cluster and no kubernetes
+# package, so they run in seconds and a broken image never reaches the
+# registry.
+name: Publish image
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python3 test_watchdog.py
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is emulated through QEMU. The image is pure Python, so the only
+      # cost is a slower `pip install` inside the arm64 layer.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=k8s-oom-watchdog
+            org.opencontainers.image.description=Workload-agnostic Kubernetes OOM watchdog sidecar using in-place pod resize
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
