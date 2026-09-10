@@ -64,7 +64,7 @@ curl <pod-ip>:8090/metrics               # Prometheus metrics
 | Kubernetes version | **≥ 1.33** (EKS ≥ 1.34); both the `/resize` subresource and native sidecars (initContainer with `restartPolicy: Always`) are GA | On the first PATCH returning 404/405 the watchdog logs an explicit CRITICAL message and exits; repeated restarts fire the `MemoryWatchdogSidecarRestarting` alert |
 | Cgroup | v2 (systemd driver; the EKS AL2023 default) | Fails to locate the cgroup at startup and exits |
 | Pod Security | The namespace must allow read-only hostPath mounts (`/sys/fs/cgroup`, `/proc/meminfo`); the PSA `restricted` profile rejects them | Pod cannot be created |
-| Alerting (monitoring stack) | Carried entirely by the monitoring stack: `deploy/monitoring/prometheus-rules.yaml` (6 PrometheusRules) + `deploy/monitoring/alertmanager-config.yaml` (delivered to your IM alert channel via an alert gateway; example channel name `your-alert-channel`), rolled out with the monitoring stack | Without the rules you only get metrics and K8s events, no active alerting — confirm the rules are deployed before enabling the watchdog |
+| Alerting (monitoring stack) | Carried entirely by the monitoring stack: `deploy/monitoring/prometheus-rules.yaml` (7 PrometheusRules) + `deploy/monitoring/alertmanager-config.yaml` (delivered to your IM alert channel via an alert gateway; example channel name `your-alert-channel`), rolled out with the monitoring stack | Without the rules you only get metrics and K8s events, no active alerting — confirm the rules are deployed before enabling the watchdog |
 
 ## How it works (overview)
 
@@ -79,7 +79,7 @@ Implementation details and design reasoning for each item live in **[docs/design
 7. **Baseline persistence**: initial limit/requests are stored in pod annotations; a sidecar restart loses no bookkeeping.
 8. **Failing loudly**: when host memory info is unreadable, refuses to scale up and alerts continuously — never silently skips.
 9. **Native sidecar**: starts before and terminates after the main container, covering the full lifecycle including very long graceful shutdowns; runs non-root with a read-only root filesystem and all capabilities dropped.
-10. **Observability**: Prometheus metrics + K8s Events + a heartbeat-driven `/healthz`; alerting is carried by the monitoring stack (6 PrometheusRules) — the watchdog only does second-level closed-loop handling and emits data points.
+10. **Observability**: Prometheus metrics + K8s Events + a heartbeat-driven `/healthz`; alerting is carried by the monitoring stack (7 PrometheusRules) — the watchdog only does second-level closed-loop handling and emits data points.
 
 ## Deployment parameters (`values.yaml`)
 
@@ -120,7 +120,7 @@ The full reasoning behind each item lives in **[docs/design.md](docs/design.md#k
 | Symptom | Meaning | Action |
 |---|---|---|
 | Alert `MemoryWatchdogResizeFailed` | Node capacity short; kubelet rejected (Infeasible) or the resize timed out unapplied | Add nodes or shard the load; the watchdog has already rolled back the spec and broken the circuit for 10 minutes |
-| CRITICAL log "watchdog lost host visibility" (metric `watchdog_blocked_total{reason="no_host_stats"}`) | `/host/proc/meminfo` mount is broken | Check the hostPath mount and node health; no scale-up is performed in this state |
+| Alert `MemoryWatchdogHostStatsUnreadable` | `/host/proc/meminfo` mount is broken, so the host safety check cannot run | Check the hostPath mount and node health; no scale-up is performed in this state and the container has no OOM rescue |
 | Alert `MemoryWatchdogHostMemoryExhausted` | The node as a whole is congested; no safe headroom | Add nodes; this is by-design protection |
 | Alert `MemoryWatchdogScaleUpBlockedAtCap` | Memory pressure persists but the cap (factor × baseline) is reached | If chronic, raise that tenant's baseline or maxMemoryFactor |
 | Alert `MemoryWatchdogSidecarRestarting` | Sidecar restarting repeatedly (prerequisites unmet / port taken / persistent main-loop errors / own OOM) | Read the container log's CRITICAL lines; meanwhile the heavy worker's ceiling stays at baseline with no OOM rescue |

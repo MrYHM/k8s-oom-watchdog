@@ -1,10 +1,18 @@
-# Alerts for the heavy-worker OOM watchdog sidecar
-# (). The watchdog acts autonomously
-# (rollback/circuit-break within seconds); these alerts exist because the
-# conditions below need HUMAN action (add nodes, fix config, replace a dead
-# sidecar) and an Infeasible resize never creates a Pending pod, so nothing
-# else surfaces them. Metrics only exist in namespaces where the watchdog is
-# enabled, so the rules are safe to install on every account.
+# Alerts for the OOM watchdog sidecar.
+#
+# The watchdog acts autonomously (rollback / circuit-break within seconds);
+# these alerts exist because the conditions below need HUMAN action (add
+# nodes, fix a mount, replace a dead sidecar) and an Infeasible resize never
+# creates a Pending pod, so nothing else surfaces them.
+#
+# Customization points when adopting this file:
+#   * runbook_url — repoint at your own fork/mirror of the README.
+#   * Namespace scope — the rules are unscoped on purpose: the watchdog
+#     metrics only exist where the sidecar is enabled, so they are safe to
+#     install cluster-wide. Add a `namespace=~"..."` matcher to every expr if
+#     you want to limit them to specific namespaces.
+#   * MemoryWatchdogSelfMemoryHigh — the 90Mi threshold tracks the sidecar's
+#     hardcoded 100Mi limit; keep the two in sync.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -18,58 +26,105 @@ spec:
       interval: 1m
       rules:
         - alert: MemoryWatchdogResizeFailed
-          expr: increase(watchdog_resize_failed_total{namespace=~"myapp-.*"}[10m]) > 0
+          expr: increase(watchdog_resize_failed_total[10m]) > 0
           for: 0m
           labels:
             severity: critical
           annotations:
-            summary: "Watchdog 原地扩容失败回滚（Infeasible/超时）!"
-            description: "{{$labels.namespace}}/{{$labels.pod}} 的 resize 在 {{$labels.stage}} 阶段失败，spec 已自动回滚并熔断 10 分钟。通常为节点容量不足：请扩容节点或横向分流——Infeasible 不会触发节点自动扩容，必须人工处置。"
+            summary: "In-place scale-up failed and was rolled back in {{$labels.namespace}}/{{$labels.pod}}"
+            description: >-
+              The resize for {{$labels.namespace}}/{{$labels.pod}} failed at the {{$labels.stage}} stage;
+              the watchdog has already rolled the spec back and opened a 10-minute circuit breaker.
+              Usually node capacity: add nodes or shard the load — an Infeasible resize never triggers
+              cluster autoscaling, so it will not resolve itself.
+            runbook_url: "https://github.com/MrYHM/k8s-oom-watchdog#failure-mode-handling"
         - alert: MemoryWatchdogHostMemoryExhausted
-          expr: increase(watchdog_blocked_total{namespace=~"myapp-.*", reason="host_full"}[10m]) > 0
+          expr: increase(watchdog_blocked_total{reason="host_full"}[10m]) > 0
           for: 0m
           labels:
             severity: critical
           annotations:
-            summary: "Watchdog 宿主机内存枯竭，扩容熔断!"
-            description: "{{$labels.namespace}}/{{$labels.pod}} 所在节点连最小步长都无法安全借出（90% 物理内存红线），扩容被拒绝以保护节点。请扩容节点或分流；期间该 pod 可能 OOM（设计内失败方向）。"
+            summary: "Host memory exhausted, scale-up circuit-broken in {{$labels.namespace}}/{{$labels.pod}}"
+            description: >-
+              The node hosting {{$labels.namespace}}/{{$labels.pod}} cannot lend even the minimum step
+              without crossing the host red line (90% of physical memory), so the scale-up was refused
+              to protect the node. Add nodes or shard the load; meanwhile this pod may OOM — the
+              by-design failure direction.
+            runbook_url: "https://github.com/MrYHM/k8s-oom-watchdog#failure-mode-handling"
+        - alert: MemoryWatchdogHostStatsUnreadable
+          # The watchdog refuses every scale-up while host memory stats are
+          # unreadable (the safety invariant cannot be evaluated), so OOM
+          # rescue is inoperative — usually a broken /host/proc/meminfo mount.
+          # Note this counter only advances once memory pressure reaches the
+          # scale-up path, so a broken mount stays invisible while the target
+          # container is idle.
+          expr: increase(watchdog_blocked_total{reason="no_host_stats"}[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Watchdog lost host visibility, OOM rescue inoperative in {{$labels.namespace}}/{{$labels.pod}}"
+            description: >-
+              The watchdog in {{$labels.namespace}}/{{$labels.pod}} cannot read host memory statistics,
+              so the host safety check cannot be evaluated and every scale-up is refused — the container
+              is running without OOM rescue. Check the /host/proc/meminfo hostPath mount and node health.
+            runbook_url: "https://github.com/MrYHM/k8s-oom-watchdog#failure-mode-handling"
         - alert: MemoryWatchdogSpecReadErrors
-          expr: increase(watchdog_spec_read_errors_total{namespace=~"myapp-.*"}[10m]) > 0
+          expr: increase(watchdog_spec_read_errors_total[10m]) > 0
           for: 0m
           labels:
             severity: critical
           annotations:
-            summary: "Watchdog 内存高压期间无法读取 pod spec!"
-            description: "{{$labels.namespace}}/{{$labels.pod}} 在内存越过扩容水位时读取 pod spec 失败（API Server 不可达？），OOM 抢救处于失效状态。请检查 API Server 与节点网络。"
+            summary: "Pod spec unreadable under memory pressure in {{$labels.namespace}}/{{$labels.pod}}"
+            description: >-
+              The watchdog failed to read the pod spec for {{$labels.namespace}}/{{$labels.pod}} while
+              memory crossed the scale-up watermark (API server unreachable?), leaving OOM rescue
+              inoperative. Check the API server and node networking.
+            runbook_url: "https://github.com/MrYHM/k8s-oom-watchdog#failure-mode-handling"
         - alert: MemoryWatchdogScaleUpBlockedAtCap
-          expr: increase(watchdog_blocked_total{namespace=~"myapp-.*", reason="max_limit"}[15m]) > 0
+          expr: increase(watchdog_blocked_total{reason="max_limit"}[15m]) > 0
           for: 0m
           labels:
             severity: warning
           annotations:
-            summary: "Watchdog 扩容达到租户配额上限（cap）"
-            description: "{{$labels.namespace}}/{{$labels.pod}} 内存压力持续但 limit 已达 maxMemoryFactor x baseline 的上限。若为常态，评估上调该租户的 heavyResources.limits（baseline）或 maxMemoryFactor。"
+            summary: "Scale-up cap reached in {{$labels.namespace}}/{{$labels.pod}}"
+            description: >-
+              Memory pressure persists in {{$labels.namespace}}/{{$labels.pod}} but the limit already sits
+              at the cap (maxMemoryFactor x baseline), so no further borrowing is possible. If this is
+              chronic, raise that deployment's baseline memory limit or its maxMemoryFactor.
+            runbook_url: "https://github.com/MrYHM/k8s-oom-watchdog#failure-mode-handling"
         - alert: MemoryWatchdogSidecarRestarting
           # The watchdog is a native sidecar (initContainer + restartPolicy
           # Always), so kube-state-metrics reports it under the
           # kube_pod_init_container_* family, NOT kube_pod_container_*.
-          expr: increase(kube_pod_init_container_status_restarts_total{namespace=~"myapp-.*", container="watchdog"}[30m]) > 2
+          expr: increase(kube_pod_init_container_status_restarts_total{container="watchdog"}[30m]) > 2
           for: 0m
           labels:
             severity: critical
           annotations:
-            summary: "Watchdog sidecar 反复重启，heavy worker 失去弹性上探!"
-            description: "{{$labels.namespace}}/{{$labels.pod}} 的 watchdog 容器 30 分钟内重启超过 2 次。期间 heavy worker 内存上限停留在 baseline，突发任务无 OOM 抢救。查看容器日志 CRITICAL 行；前提不满足时应关闭 watchdog.enabled。"
+            summary: "Watchdog sidecar restarting repeatedly in {{$labels.namespace}}/{{$labels.pod}}"
+            description: >-
+              The watchdog container in {{$labels.namespace}}/{{$labels.pod}} restarted more than twice in
+              30 minutes. Meanwhile the target container's memory ceiling stays at its baseline and bursts
+              get no OOM rescue. Read the container log's CRITICAL lines; if the cluster does not meet the
+              prerequisites, turn watchdog.enabled off.
+            runbook_url: "https://github.com/MrYHM/k8s-oom-watchdog#failure-mode-handling"
         - alert: MemoryWatchdogSelfMemoryHigh
-          # Absolute threshold on purpose: the limit is hardcoded to 100Mi in
-          # deployment_h.yaml (not tenant-configurable), and as an init
-          # container the watchdog has no kube_pod_container_resource_limits
-          # series to divide by. 90Mi = 90% of that limit; keep the two in
-          # sync if the limit ever changes.
-          expr: container_memory_working_set_bytes{namespace=~"myapp-.*", container="watchdog"} > 90 * 1024 * 1024
+          # Absolute threshold on purpose: the sidecar limit is hardcoded to
+          # 100Mi in the deployment template (not tenant-configurable), and as
+          # an init container the watchdog has no
+          # kube_pod_container_resource_limits series to divide by.
+          # 90Mi = 90% of that limit.
+          expr: container_memory_working_set_bytes{container="watchdog"} > 90 * 1024 * 1024
           for: 10m
           labels:
             severity: warning
           annotations:
-            summary: "Watchdog 容器自身内存使用率超过 90%"
-            description: "{{$labels.namespace}}/{{$labels.pod}} 的 watchdog 常驻内存应为约 70Mi 的常数；贴近 100Mi limit 通常意味着有人在容器内 exec 了重型诊断进程（禁止），或依赖包升级抬高了基线（需将 limit 提至 128Mi 并同步调整本告警阈值）。当前 {{ humanize1024 $value }}B。"
+            summary: "Watchdog container above 90% of its own memory limit in {{$labels.namespace}}/{{$labels.pod}}"
+            description: >-
+              The watchdog in {{$labels.namespace}}/{{$labels.pod}} is at {{ humanize1024 $value }}B, but its
+              resident footprint should be a constant ~70Mi. Approaching the 100Mi limit usually means
+              someone exec'ed a heavyweight diagnostic process inside the container (forbidden), or a
+              dependency upgrade raised the baseline — in which case lift the limit to 128Mi and update this
+              alert's threshold to match.
+            runbook_url: "https://github.com/MrYHM/k8s-oom-watchdog#failure-mode-handling"

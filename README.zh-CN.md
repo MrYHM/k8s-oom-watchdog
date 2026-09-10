@@ -64,7 +64,7 @@ curl <pod-ip>:8090/metrics               # Prometheus 指标
 | Kubernetes 版本 | **≥ 1.33**（EKS ≥ 1.34），`/resize` 子资源与原生 sidecar（initContainer `restartPolicy: Always`）均 GA | watchdog 首次 PATCH 收到 404/405 时打出明确 CRITICAL 日志并退出，反复重启触发 `MemoryWatchdogSidecarRestarting` 告警 |
 | Cgroup | v2（systemd driver，EKS AL2023 默认） | 启动时定位 cgroup 失败并退出 |
 | Pod Security | 命名空间需允许 hostPath 只读挂载（`/sys/fs/cgroup`、`/proc/meminfo`），PSA `restricted` 档位会拒绝 | Pod 无法创建 |
-| 告警（监控栈） | 由监控栈统一承载：`deploy/monitoring/prometheus-rules.yaml`（6 条 PrometheusRule）+ `deploy/monitoring/alertmanager-config.yaml`（经告警网关送达 IM 告警群，示例通道名 your-alert-channel），随监控栈发布生效 | 未部署规则则只有指标与 K8s 事件，无主动告警——启用 watchdog 前必须先确认规则已下发 |
+| 告警（监控栈） | 由监控栈统一承载：`deploy/monitoring/prometheus-rules.yaml`（7 条 PrometheusRule）+ `deploy/monitoring/alertmanager-config.yaml`（经告警网关送达 IM 告警群，示例通道名 your-alert-channel），随监控栈发布生效 | 未部署规则则只有指标与 K8s 事件，无主动告警——启用 watchdog 前必须先确认规则已下发 |
 
 ## 工作机制（概览）
 
@@ -79,7 +79,7 @@ curl <pod-ip>:8090/metrics               # Prometheus 指标
 7. **Baseline 持久化**：初始 limit/requests 写入 pod annotation，sidecar 重启不丢账。
 8. **失效自省**：读不到宿主机内存时拒绝扩容并持续高危告警，绝不静默跳过。
 9. **原生 sidecar**：先于主容器启动、晚于其终止，覆盖含超长优雅退出期的完整生命周期；非 root、只读根文件系统、drop 全部 capabilities。
-10. **可观测性**：Prometheus 指标 + K8s Events + 心跳驱动的 `/healthz`；告警由监控栈统一承载（6 条 PrometheusRule），watchdog 只负责秒级闭环处置与打点。
+10. **可观测性**：Prometheus 指标 + K8s Events + 心跳驱动的 `/healthz`；告警由监控栈统一承载（7 条 PrometheusRule），watchdog 只负责秒级闭环处置与打点。
 
 ## 部署参数（`values.yaml`）
 
@@ -120,7 +120,7 @@ worker:
 | 现象 | 含义 | 处置 |
 |---|---|---|
 | 告警 `MemoryWatchdogResizeFailed` | 节点容量不足，kubelet 拒绝（Infeasible）或超时未应用 | 扩容节点或横向分流；watchdog 已自动回滚 spec 并熔断 10 分钟 |
-| 日志 CRITICAL "看门狗失去宿主机视野"（指标 `watchdog_blocked_total{reason="no_host_stats"}`） | `/host/proc/meminfo` 挂载异常 | 检查 hostPath 挂载与节点状态；此状态下不会执行任何扩容 |
+| 告警 `MemoryWatchdogHostStatsUnreadable` | `/host/proc/meminfo` 挂载异常，宿主机安全校验无法执行 | 检查 hostPath 挂载与节点状态；此状态下不会执行任何扩容，容器无 OOM 抢救 |
 | 告警 `MemoryWatchdogHostMemoryExhausted` | 节点整体拥塞，无安全空间 | 扩容节点；这是设计内的保护行为 |
 | 告警 `MemoryWatchdogScaleUpBlockedAtCap` | 内存压力持续但已达 cap（factor × baseline） | 若为常态，上调该租户 baseline 或 maxMemoryFactor |
 | 告警 `MemoryWatchdogSidecarRestarting` | sidecar 反复重启（前提不满足 / 端口占用 / 主循环持续异常 / 自身 OOM） | 看容器日志 CRITICAL 行；期间 heavy worker 上限停留在 baseline，无 OOM 抢救 |
