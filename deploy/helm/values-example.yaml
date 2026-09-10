@@ -52,6 +52,6 @@ worker:
     serviceMonitor: true
     ## ValidatingAdmissionPolicy pinning the watchdog SA's writes to
     ## heavy-worker pods only (labels immutable, two baseline annotations,
-    ## memory-only resize). Requires K8s >= 1.30 (VAP GA); our clusters are
-    ## 1.34. Disable only if the cluster rejects the API.
+    ## memory-only resize). Requires K8s >= 1.30 (VAP GA). Disable only if
+    ## the cluster rejects the API.
     admissionGuard: true

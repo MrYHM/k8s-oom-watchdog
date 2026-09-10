@@ -271,7 +271,7 @@ class TestCgroupParsing(unittest.TestCase):
 class TestFindPodCgroupDir(unittest.TestCase):
     """The mountinfo fast path only works in a HOST cgroup namespace (the
     root field then carries the real host path). Under a PRIVATE cgroup
-    namespace -- the default on the EKS clusters we deploy to -- the root
+    namespace -- the default on EKS -- the root
     field is rendered relative to the container's own cgroup ("/" for its
     own mount, "/.." chains for the hostPath bind mount) and must be
     rejected so the pod-UID glob fallback can run."""
@@ -632,8 +632,7 @@ class TestWatchdogStateMachine(unittest.TestCase):
 
 class TestResolveMaxLimit(unittest.TestCase):
     """Cap derivation: the cap is ALWAYS factor x baseline (no absolute cap
-    exists), so one chart-wide parameter adapts to every tenant's limits
-    tier. Runtime borrowing is still bounded by the host ceiling and kubelet
+    exists), so one chart-wide parameter adapts to every deployment tier. Runtime borrowing is still bounded by the host ceiling and kubelet
     allocatable admission."""
 
     def test_factor_scales_baseline(self):
@@ -663,7 +662,8 @@ class TestResolveMaxLimit(unittest.TestCase):
 
 
 class TestBaselineRequestsRestore(unittest.TestCase):
-    """Prod tenants oversubscribe (requests 500Mi vs limits 8Gi). Because a
+    """Oversubscribed pods declare requests far below limits (say 500Mi
+    requests against an 8Gi limit). Because a
     resize always moves requests together with limits (scheduler accounting
     while borrowing), returning to baseline must also restore the ORIGINAL
     requests -- otherwise one burst permanently locks baseline-sized
@@ -880,8 +880,8 @@ class TestPodApiEvents(unittest.TestCase):
         # The API server validates metadata.generateName as a DNS-1123
         # subdomain, masking only a TRAILING DASH (deployment-style "foo-").
         # A trailing dot fails validation with 422 and every watchdog event
-        # silently disappears -- exactly what happened on the first live
-        # cluster. Guard the exact prefix rule here.
+        # silently disappears -- observed on a live cluster. Guard the exact
+        # prefix rule here.
         import re
         gen = self._emit("heavy-worker-7c58d9445-ddm29")["metadata"]["generateName"]
         candidate = gen[:-1] + "a" if gen.endswith("-") else gen
