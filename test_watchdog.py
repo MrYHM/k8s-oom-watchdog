@@ -838,6 +838,11 @@ class TestMetricsServer(unittest.TestCase):
         blocker = socket.socket()
         blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         blocker.bind(("", 0))
+        # listen() matters: Linux lets a second SO_REUSEADDR socket bind a
+        # port that is merely bound, and HTTPServer sets SO_REUSEADDR, so
+        # without an actual listener this test passes on BSD/macOS and
+        # silently does nothing on Linux.
+        blocker.listen(1)
         port = blocker.getsockname()[1]
         try:
             with self.assertRaises(OSError):
