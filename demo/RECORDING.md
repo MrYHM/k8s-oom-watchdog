@@ -53,8 +53,19 @@ Pick one:
       Order matters: apply the manifest first (it creates the namespace and
       SA), then create the secret and patch, then delete the pod so it is
       rescheduled with the secret.
-- [ ] **Build it yourself into a registry the nodes can already reach** — swap
-      the `image:` line in the manifest for that reference.
+- [ ] **Build it yourself into a registry the nodes can already reach** — no
+      manifest edit needed, pass `IMAGE` to `setup.sh`. For ECR:
+      ```bash
+      REGION=<region>; ACCOUNT=<account-id>
+      REGISTRY=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com   # add .cn in AWS China
+      aws ecr create-repository --repository-name oom-watchdog --region $REGION
+      aws ecr get-login-password --region $REGION \
+        | docker login --username AWS --password-stdin $REGISTRY
+      # Match your node architecture; --platform can list both.
+      docker buildx build --platform linux/arm64 \
+        -t $REGISTRY/oom-watchdog:demo --push .
+      IMAGE=$REGISTRY/oom-watchdog:demo ./setup.sh
+      ```
 - [ ] **kind only**: `docker build -t oom-watchdog:demo . && kind load
       docker-image oom-watchdog:demo`, then set `image: oom-watchdog:demo` and
       `imagePullPolicy: IfNotPresent`.

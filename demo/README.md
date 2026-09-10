@@ -36,6 +36,14 @@ Deliberately small so the whole rescue is visible in seconds:
 ./demo.sh     # drive one rescue, printing a live status table
 ```
 
+If your cluster cannot pull from ghcr.io, push the image to a registry it can
+reach and point `IMAGE` at it (`PULL_POLICY=IfNotPresent` for images loaded
+straight into the node):
+
+```bash
+IMAGE=<your-registry>/oom-watchdog:demo ./setup.sh
+```
+
 `demo.sh` prints one line per second from the watchdog's own `/metrics`, so
 the working set is the same number its decisions use (page cache already
 subtracted):
