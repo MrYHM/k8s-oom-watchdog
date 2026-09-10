@@ -18,10 +18,11 @@ Deliberately small so the whole rescue is visible in seconds:
 - **Kubernetes >= 1.33** (`setup.sh` checks and refuses otherwise).
 - A namespace that allows **read-only hostPath mounts** — the manifest creates
   `watchdog-demo` without a restricted PSA label for exactly this reason.
-- The image `ghcr.io/mryhm/k8s-oom-watchdog:latest`, published by the
-  `publish-image` workflow. Before the first release, build and load your own:
-  `docker build -t ghcr.io/mryhm/k8s-oom-watchdog:latest .` (with kind:
-  `kind load docker-image ghcr.io/mryhm/k8s-oom-watchdog:latest`).
+- The image `ghcr.io/mryhm/k8s-oom-watchdog:edge`, built from master by the
+  `publish-image` workflow. **While the GitHub repo is private the GHCR
+  package is private too**, so the cluster needs an imagePullSecret — see
+  [RECORDING.md](RECORDING.md#2-make-the-image-reachable-from-the-cluster) for
+  that and for the build-it-yourself alternatives.
 - Managed clusters (EKS/GKE/AKS) and kubeadm nodes are the reliable targets.
   kind/minikube run nodes inside containers, so the cgroup hierarchy is
   nested and `/proc/meminfo` reflects the VM rather than the node — the
@@ -52,6 +53,10 @@ restarts: 0
 Tear down with `kubectl delete -f watchdog-demo.yaml`.
 
 ## Record the GIF
+
+**[RECORDING.md](RECORDING.md) is the full checklist** — cluster choice, making
+the private image reachable, a trial run to verify before recording, size and
+quality gates, and a troubleshooting table. The short version:
 
 **With [vhs](https://github.com/charmbracelet/vhs)** (declarative, repeatable):
 

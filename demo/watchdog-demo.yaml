@@ -72,7 +72,9 @@ spec:
         # Native sidecar: starts before the target container and terminates
         # after it, so the whole lifecycle is supervised.
         - name: watchdog
-          image: ghcr.io/mryhm/k8s-oom-watchdog:latest
+          # :edge is built from master on every push. Releases also carry
+          # :latest and :<version> -- pin a version outside demos.
+          image: ghcr.io/mryhm/k8s-oom-watchdog:edge
           restartPolicy: Always
           imagePullPolicy: Always
           env:
