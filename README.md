@@ -2,6 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+![Publish image](https://github.com/MrYHM/k8s-oom-watchdog/actions/workflows/publish-image.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Kubernetes](https://img.shields.io/badge/kubernetes-%E2%89%A5%201.33-326CE5)
 ![Python](https://img.shields.io/badge/python-3.12-3776AB)
@@ -35,14 +36,35 @@ flowchart LR
   W -- "K8s Events" --> API
 ```
 
-## Quick start
+## See it work
 
-**1. Build and push the image** (arm64 example; adjust `--platform` for amd64):
+<!-- Record the GIF with demo/demo.tape (see demo/README.md), then uncomment:
+![In-place OOM rescue](demo/demo.gif)
+-->
+
+[`demo/`](demo/) ships a self-contained demo — its own namespace, RBAC and a
+256Mi target container — that drives memory past the watermark and shows the
+limit being raised **in place**, `restarts: 0` at the end. Two commands on any
+v1.33+ cluster:
 
 ```bash
-docker buildx build --platform linux/arm64 \
-  -t <your-registry>/memory-watchdog:<tag> \
-  --push .
+cd demo && ./setup.sh && ./demo.sh
+```
+
+## Quick start
+
+**1. Pull the image** — published for `linux/amd64` and `linux/arm64` on every
+release:
+
+```bash
+docker pull ghcr.io/mryhm/k8s-oom-watchdog:latest
+```
+
+Pin a version in production (`:0.1.0` rather than `:latest`). To build your own
+instead:
+
+```bash
+docker build -t <your-registry>/memory-watchdog:<tag> .
 ```
 
 The image pip-installs a pinned `kubernetes` client (the resize-subresource methods require ≥ 33; older versions fall back to the raw-API path).
@@ -109,7 +131,6 @@ The full reasoning behind each item lives in **[docs/design.md](docs/design.md#k
 - **RBAC granularity**: the SA can nominally patch any pod in the namespace; a projected token + a ValidatingAdmissionPolicy (7 CEL checks) narrow it to "memory resize of the target container only".
 - **Infeasible is the by-design failure direction**: on tight nodes the kubelet rejects the scale-up; automatic rollback + circuit breaker. Frequent occurrences mean genuine capacity shortage.
 - **Does not trigger node autoscaling**: Infeasible produces no Pending pods, so cluster-autoscaler / Karpenter never notice; add nodes manually.
-- **Image defaults to arm64**: the base image is multi-arch; adjust `--platform` at build time for amd64.
 - **Sidecar down = ceiling stays at baseline**: never worse than not enabling the watchdog, but bursts lose OOM rescue; the corresponding alerts ship with the monitoring stack.
 - **Requests are temporarily raised while borrowing**: initial requests are restored automatically on falling back to baseline — an overcommitted shape's scheduling headroom is fully returned.
 - **The main container no longer mounts an SA token**: `automountServiceAccountToken: false`; the token is mounted only into the watchdog container.

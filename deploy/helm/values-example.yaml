@@ -43,8 +43,10 @@ worker:
     allowBlindScaleup: false
     ## Port for the /metrics + /healthz endpoint (liveness probe target).
     metricsPort: 8090
-    repository: "registry.example.com/memory-watchdog"
-    tag: "v1.8"
+    ## Published multi-arch (amd64 + arm64) on every release; pin a
+    ## version rather than tracking :latest.
+    repository: "ghcr.io/mryhm/k8s-oom-watchdog"
+    tag: "0.1.0"
     ## Create a headless Service + ServiceMonitor so Prometheus scrapes
     ## :8090/metrics. Requires the prometheus-operator CRDs; disable otherwise.
     ## Alerting is handled by the monitoring stack (PrometheusRule memory-watchdog-rules

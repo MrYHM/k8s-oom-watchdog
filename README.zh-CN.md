@@ -2,6 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+![Publish image](https://github.com/MrYHM/k8s-oom-watchdog/actions/workflows/publish-image.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Kubernetes](https://img.shields.io/badge/kubernetes-%E2%89%A5%201.33-326CE5)
 ![Python](https://img.shields.io/badge/python-3.12-3776AB)
@@ -35,14 +36,32 @@ flowchart LR
   W -- "K8s Events" --> API
 ```
 
-## 快速上手
+## 效果演示
 
-**1. 构建并推送镜像**（arm64 示例，amd64 调整 `--platform` 即可）：
+<!-- 用 demo/demo.tape 录制 GIF（见 demo/README.md），然后取消注释：
+![原地 OOM 抢救](demo/demo.gif)
+-->
+
+[`demo/`](demo/) 提供一个自包含的演示（独立命名空间、RBAC、256Mi 目标容器）：
+把内存推过水位线，看着 limit **原地**被抬高，结束时 `restarts: 0`。在任何
+v1.33+ 集群上两条命令即可：
 
 ```bash
-docker buildx build --platform linux/arm64 \
-  -t <your-registry>/memory-watchdog:<tag> \
-  --push .
+cd demo && ./setup.sh && ./demo.sh
+```
+
+## 快速上手
+
+**1. 拉取镜像**——每次发布都构建 `linux/amd64` 与 `linux/arm64` 双架构：
+
+```bash
+docker pull ghcr.io/mryhm/k8s-oom-watchdog:latest
+```
+
+生产环境请固定版本号（用 `:0.1.0` 而不是 `:latest`）。若要自行构建：
+
+```bash
+docker build -t <your-registry>/memory-watchdog:<tag> .
 ```
 
 镜像内通过 pip 安装了固定版本的 `kubernetes` 客户端（resize 子资源方法需要 ≥33 版本，旧版本走 raw API 兜底路径）。
@@ -109,7 +128,6 @@ worker:
 - **RBAC 粒度**：SA 名义上可 patch 命名空间内任意 pod，由 projected token + ValidatingAdmissionPolicy（7 条 CEL 校验）双层收窄到"仅目标容器的 memory resize"。
 - **Infeasible 是设计内失败方向**：节点紧张时扩容被 kubelet 拒绝，自动回滚 + 熔断；频繁出现说明节点容量真的不足。
 - **不触发节点自动扩容**：Infeasible 不产生 Pending pod，cluster-autoscaler / Karpenter 无感知，需人工扩节点。
-- **镜像默认 arm64**：基础镜像为多架构官方镜像，构建时调整 `--platform` 即可支持 amd64。
 - **sidecar 失效 = 上限停留在 baseline**：不会比不启用更差，但失去 OOM 抢救；对应告警已随监控栈落地。
 - **借用期间 requests 临时抬升**：回落 baseline 时自动恢复初始 requests，超卖形态的调度余量完整归还。
 - **主容器不再挂载 SA token**：`automountServiceAccountToken: false`，token 仅挂给 watchdog 容器。

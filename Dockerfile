@@ -1,6 +1,6 @@
-# The base image is multi-arch; pick the target platform at build time,
-# e.g. `docker buildx build --platform linux/arm64` for Graviton/ARM node
-# groups (add linux/amd64 for x86 nodes).
+# The base image is multi-arch. Releases are published for linux/amd64 and
+# linux/arm64 by .github/workflows/publish-image.yml; a plain `docker build`
+# here just produces an image for whatever platform you are on.
 FROM python:3.12-slim
 
 WORKDIR /app

@@ -1,0 +1,162 @@
+# Self-contained watchdog demo: one Deployment whose target container gets
+# rescued from an OOM kill in place, with everything the sidecar needs (SA,
+# Role, RoleBinding, hostPath mounts) in this single file.
+#
+# Deliberately small so it fits any node and the whole rescue is visible in
+# seconds: baseline 256Mi, 128Mi steps, cap 4 x baseline = 1Gi.
+#
+# Requires Kubernetes >= 1.33 and a namespace that allows read-only hostPath
+# mounts (the demo namespace below is created without a restricted PSA
+# label). Not for production — see deploy/ for the real templates.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: watchdog-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: watchdog
+  namespace: watchdog-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: watchdog
+  namespace: watchdog-demo
+rules:
+  # pods/resize is the in-place vertical scaling subresource (K8s >= 1.33).
+  # `pods` get+patch is needed to read the spec and persist the baseline
+  # annotations; events create is for the K8s Events the watchdog emits.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/resize"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: watchdog
+  namespace: watchdog-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: watchdog
+subjects:
+  - kind: ServiceAccount
+    name: watchdog
+    namespace: watchdog-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bursty-worker
+  namespace: watchdog-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bursty-worker
+  template:
+    metadata:
+      labels:
+        app: bursty-worker
+    spec:
+      serviceAccountName: watchdog
+      initContainers:
+        # Native sidecar: starts before the target container and terminates
+        # after it, so the whole lifecycle is supervised.
+        - name: watchdog
+          image: ghcr.io/mryhm/k8s-oom-watchdog:latest
+          restartPolicy: Always
+          imagePullPolicy: Always
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: WATCHDOG_TARGET_CONTAINER
+              value: "bursty-worker"
+            - name: WATCHDOG_THRESHOLD
+              value: "0.8"
+            - name: WATCHDOG_INTERVAL
+              value: "0.1"
+            # Small steps keep the demo legible: 256Mi -> 384 -> 512 -> ...
+            - name: WATCHDOG_STEP
+              value: "128Mi"
+            # cap = 4 x 256Mi = 1Gi, comfortably above the 700Mi the stress
+            # tool asks for, so the rescue succeeds instead of hitting the cap.
+            - name: WATCHDOG_MAX_FACTOR
+              value: "4.0"
+            - name: WATCHDOG_HOST_CEILING
+              value: "0.90"
+          ports:
+            - name: metrics
+              containerPort: 8090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          volumeMounts:
+            - mountPath: /host/sys/fs/cgroup
+              name: host-cgroup
+              readOnly: true
+            - mountPath: /host/proc/meminfo
+              name: host-proc-meminfo
+              readOnly: true
+      containers:
+        - name: bursty-worker
+          image: python:3.12-slim
+          command: ["sleep", "infinity"]
+          # resizePolicy keeps the container running while memory changes —
+          # without NotRequired the kubelet would restart it on every resize.
+          resizePolicy:
+            - resourceName: memory
+              restartPolicy: NotRequired
+          resources:
+            limits:
+              cpu: 500m
+              # This is the baseline the watchdog records and returns to.
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+      volumes:
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: host-proc-meminfo
+          hostPath:
+            path: /proc/meminfo
+            type: File
