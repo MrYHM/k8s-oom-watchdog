@@ -125,13 +125,16 @@ class TestDecideScaleUp(unittest.TestCase):
         self.assertEqual(decision.action, Action.BLOCKED_MAX_LIMIT)
 
     def test_host_ceiling_triggers_adaptive_step_down(self):
+        # The ceiling is pinned here rather than taken from the default: this
+        # test covers the adaptive step-down arithmetic, not what the default
+        # happens to be (TestConfigDefaults guards that).
         # 20GiB host, ceiling 85% = 17GiB. Pod uses 8GiB of the host's 14GiB
         # used => others use 6GiB. Full step 10+4=14GiB projects 20GiB > 17GiB.
         # Max safe step = 17 - 10 - 6 = 1GiB (512Mi-aligned).
         decision = decide_scale_up(
             Sample(working_set=8 * GIB, cgroup_max=10 * GIB, spec_limit=10 * GIB,
                    baseline=2 * GIB, host_total=20 * GIB, host_available=6 * GIB),
-            make_cfg(),
+            make_cfg(host_ceiling=0.85),
         )
         self.assertEqual(decision.action, Action.SCALE_UP_ADAPTIVE)
         self.assertEqual(decision.target_bytes, 11 * GIB)
@@ -659,6 +662,22 @@ class TestResolveMaxLimit(unittest.TestCase):
         finally:
             del os.environ["WATCHDOG_MAX_FACTOR"]
         self.assertEqual(watchdog.load_config().max_factor, 2.0)  # code default
+
+
+class TestConfigDefaults(unittest.TestCase):
+    """The chart, values example and docs all state a 90% host red line. A
+    container started without WATCHDOG_HOST_CEILING (the demo, or anyone not
+    using the chart) must agree with them, so the default is asserted here
+    instead of only living in a comment."""
+
+    def test_host_ceiling_default_is_90_percent(self):
+        self.assertEqual(watchdog.Config().host_ceiling, 0.90)
+        prior = os.environ.pop("WATCHDOG_HOST_CEILING", None)
+        try:
+            self.assertEqual(watchdog.load_config().host_ceiling, 0.90)
+        finally:
+            if prior is not None:
+                os.environ["WATCHDOG_HOST_CEILING"] = prior
 
 
 class TestBaselineRequestsRestore(unittest.TestCase):

@@ -139,7 +139,7 @@ class Config:
     step_bytes: int = 4 * GIB         # preferred scale-up step
     max_limit_bytes: int = 48 * GIB   # resolved cap; see resolve_max_limit()
     max_factor: float = 2.0           # cap = factor x baseline
-    host_ceiling: float = 0.85        # host physical memory red line
+    host_ceiling: float = 0.90        # host physical memory red line
     min_step_bytes: int = 512 * MIB   # granularity / minimum worthwhile step
     scale_down_ratio: float = 0.4     # scale-down watermark (fraction of limit)
     scale_down_cooldown: float = 180.0
@@ -159,7 +159,7 @@ def load_config() -> Config:
         poll_interval=float(os.environ.get("WATCHDOG_INTERVAL", "0.1")),
         step_bytes=parse_memory_to_bytes(os.environ.get("WATCHDOG_STEP", "4Gi")),
         max_factor=float(os.environ.get("WATCHDOG_MAX_FACTOR", "2.0") or 2.0),
-        host_ceiling=float(os.environ.get("WATCHDOG_HOST_CEILING", "0.85")),
+        host_ceiling=float(os.environ.get("WATCHDOG_HOST_CEILING", "0.90")),
         allow_blind_scaleup=_flag("WATCHDOG_ALLOW_BLIND_SCALEUP"),
         metrics_port=int(os.environ.get("WATCHDOG_METRICS_PORT", "8090")),
     )
