@@ -32,7 +32,8 @@ classifiers = [
 
 # Pinned, not ranged: the resize-subresource methods the watchdog calls are
 # generated from the Kubernetes >= 1.33 OpenAPI spec, and older clients fall
-# back to a raw-API path. Keep this in step with the Dockerfile.
+# back to a raw-API path. This is the single source of truth -- the Dockerfile
+# reads it from here rather than repeating the pin.
 dependencies = ["kubernetes==33.1.0"]
 
 [project.optional-dependencies]

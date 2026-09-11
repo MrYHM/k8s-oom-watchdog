@@ -12,7 +12,7 @@ No cluster, no dependencies, no fixtures:
 python3 test_watchdog.py
 ```
 
-63 tests, well under a second. They import the production module directly and
+62 tests, well under a second. They import the production module directly and
 use only the standard library — the `kubernetes` package is **not** needed,
 because every clock, API call and file read enters `Watchdog` through an
 injectable seam. This is the project's main design constraint: **if a change

@@ -59,7 +59,6 @@ Changing one of these without the other leaves the repo self-contradictory:
 
 | Value | Lives in |
 |---|---|
-| `kubernetes==33.1.0` | `Dockerfile` **and** `pyproject.toml` |
 | `hostCeiling` default `0.90` | `watchdog.py` (dataclass default **and** the env fallback), `examples/*.yaml`, both READMEs — `TestConfigDefaults` guards this pair, so a drift fails the tests |
 | Alert rule count (currently **7**) | `deploy/monitoring/prometheus-rules.yaml` and four prose mentions across both READMEs and both design docs |
 | VAP check count (currently **7**) | `examples/admission-policy.yaml` and the table in both design docs |
@@ -109,7 +108,7 @@ cluster — treat them as code, not scripts.
 ## Before committing
 
 ```bash
-python3 test_watchdog.py                          # 63 tests, no deps, < 1s
+python3 test_watchdog.py                          # no deps, no cluster, < 1s
 kubectl apply --dry-run=server -f examples/       # if you touched examples/
 ```
 
