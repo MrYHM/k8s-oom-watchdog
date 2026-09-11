@@ -115,6 +115,13 @@ kubectl apply --dry-run=server -f examples/       # if you touched examples/
 CI runs the tests and a multi-arch image build on every push and PR. Editing
 anything under `.github/workflows/` requires a token with the `workflow` scope.
 
+**`main` is protected: every change goes through a pull request**, including
+one-line doc fixes, and both CI checks (`test`, `publish`) must pass before a
+merge. A direct push is rejected with `GH013: Repository rule violations`. The
+repository owner can merge without a separate approval, but cannot push
+straight to the branch, so the flow is always: branch, push, open a PR, let CI
+run, merge.
+
 Never commit local operational details — registry hostnames, account IDs,
 cluster names, namespaces from a real environment. `examples/` and `demo/` use
 neutral placeholders throughout; keep it that way.
