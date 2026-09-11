@@ -49,6 +49,39 @@ v1.33+ cluster:
 cd demo && ./setup.sh && ./demo.sh
 ```
 
+## Why not VPA?
+
+The Vertical Pod Autoscaler resizes in place too: `InPlaceOrRecreate` went GA
+in [VPA 1.6.0](https://github.com/kubernetes/autoscaler/blob/master/vertical-pod-autoscaler/docs/features.md)
+(February 2026) and needs the same Kubernetes 1.33+ `InPlacePodVerticalScaling`
+gate this sidecar does. So the fair question is what this adds.
+
+**VPA corrects sizing after the fact; this watchdog tries to prevent the kill.**
+VPA's recommender raises memory *once a container has been OOMKilled*, bumping
+the request to the last observed peak plus 20% (`OOMBumpUpRatio`) so the *next*
+burst survives. Its input is a metrics pipeline, which adds latency of its own —
+[independent analysis](https://scaleops.com/blog/kubernetes-vpa/) puts it at
+60–90 seconds. That is the right design for long-term right-sizing, and it is
+also why the first OOM is not something VPA can head off. This sidecar reads the
+target container's cgroup directly every 100ms and patches `/resize` the moment
+the working set crosses 80% of the limit: the decision never leaves the node and
+the whole loop is seconds.
+
+**The shape differs too.** VPA is three cluster-scoped components (recommender,
+updater, admission controller) governing declared requests fleet-wide. This is
+one sidecar inside one pod with no cluster-level state — its blast radius is the
+pod it supervises, and if it dies that pod simply keeps its baseline limit.
+
+**They compose.** Let VPA own the baseline a deployment starts at; let the
+watchdog borrow above it during a burst and hand it back afterwards. Resizes the
+watchdog did not initiate are [adopted and supervised rather than overwritten](docs/design.md#how-it-works),
+so an external actor moving the spec does not start a tug-of-war.
+
+**When you do not need this:** if your memory profile is predictable and drifts
+slowly, VPA alone is simpler and enough. This project earns its place when
+bursts are sharp enough that the kill lands before any recommendation loop can
+react.
+
 ## Quick start
 
 **1. Pull the image** — published for `linux/amd64` and `linux/arm64` on every

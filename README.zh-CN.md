@@ -48,6 +48,34 @@ v1.33+ 集群上两条命令即可：
 cd demo && ./setup.sh && ./demo.sh
 ```
 
+## 为什么不用 VPA？
+
+Vertical Pod Autoscaler 现在也能原地扩缩容：`InPlaceOrRecreate` 已在
+[VPA 1.6.0](https://github.com/kubernetes/autoscaler/blob/master/vertical-pod-autoscaler/docs/features.md)
+（2026 年 2 月）GA，且与本 sidecar 一样依赖 Kubernetes 1.33+ 的
+`InPlacePodVerticalScaling`。所以该问的是：这个项目还补充了什么。
+
+**VPA 是事后纠正尺寸，这个看门狗是事前拦住那次 kill。** VPA 的 recommender
+在容器**已经被 OOMKilled 之后**才抬高内存——把 request 提到最后观测到的峰值加
+20%（`OOMBumpUpRatio`），让**下一次**突发能扛过去。它的输入是指标管道，本身还有
+延迟（[第三方分析](https://scaleops.com/blog/kubernetes-vpa/)给出 60~90 秒）。
+对"长期把规格调对"这个目标而言这是正确的设计，但也正因如此，第一次 OOM 不是 VPA
+能拦下的。本 sidecar 每 100ms 直接读目标容器的 cgroup，工作集一越过 limit 的 80%
+就 PATCH `/resize`：决策全程不出节点，整个闭环是秒级。
+
+**形态也不同。** VPA 是三个集群级组件（recommender、updater、admission
+controller），统管全集群声明的 requests。本项目是单个 pod 内的一个 sidecar，没有
+任何集群级状态——影响半径就是它监督的那个 pod，即使它挂了，该 pod 也只是停留在
+baseline 上限。
+
+**两者可以叠加。** 让 VPA 负责 deployment 启动时的 baseline 是否合理，让看门狗在
+突发时临时借用、结束后归还。非自己发起的 resize 会被
+[收编监督而非覆盖](docs/design.zh-CN.md#工作机制)，所以外部 actor 改动 spec 不会引发互相拉扯。
+
+**什么时候不需要这个项目：** 如果你的内存曲线可预测、变化平缓，只用 VPA 更简单也
+足够。本项目的价值出现在突发足够陡峭、以至于任何推荐回路反应过来之前 kill 就已经
+落下的场景。
+
 ## 快速上手
 
 **1. 拉取镜像**——每次发布都构建 `linux/amd64` 与 `linux/arm64` 双架构：
