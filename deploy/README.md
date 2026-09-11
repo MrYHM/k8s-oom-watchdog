@@ -10,7 +10,7 @@
 | 文件 | 作用 |
 |---|---|
 | `prometheus-rules.yaml` | PrometheusRule：7 条告警（resize 失败、宿主机枯竭、宿主机视野丢失、spec 读取失败、到达 cap、sidecar 反复重启、自身内存贴线），每条带 runbook_url |
-| `alertmanager-config.yaml` | AlertmanagerConfig：`MemoryWatchdog.*` 路由到 IM 告警通道（示例为 Opsgenie 风格网关），severity 映射到优先级，critical 每小时重复 |
+| `alertmanager-config.yaml` | AlertmanagerConfig：`MemoryWatchdog.*` 的路由与聚合——按 alertname+namespace 分组、critical 每小时重复（其余 6h）、开启恢复通知。接收方是一个 webhook 占位符，需替换为你自己的告警去向 |
 
 两份都是可直接 apply 的对象，按需替换命名空间过滤与接收方配置：
 

@@ -131,7 +131,7 @@ curl <pod-ip>:8090/metrics               # Prometheus metrics
 | Kubernetes version | **≥ 1.33** (EKS ≥ 1.34); both the `/resize` subresource and native sidecars (initContainer with `restartPolicy: Always`) are GA | On the first PATCH returning 404/405 the watchdog logs an explicit CRITICAL message and exits; repeated restarts fire the `MemoryWatchdogSidecarRestarting` alert |
 | Cgroup | v2 (systemd driver; the EKS AL2023 default) | Fails to locate the cgroup at startup and exits |
 | Pod Security | The namespace must allow read-only hostPath mounts (`/sys/fs/cgroup`, `/proc/meminfo`); the PSA `restricted` profile rejects them | Pod cannot be created |
-| Alerting (monitoring stack) | Carried entirely by the monitoring stack: `deploy/monitoring/prometheus-rules.yaml` (7 PrometheusRules) + `deploy/monitoring/alertmanager-config.yaml` (delivered to your IM alert channel via an alert gateway; example channel name `your-alert-channel`), rolled out with the monitoring stack | Without the rules you only get metrics and K8s events, no active alerting — confirm the rules are deployed before enabling the watchdog |
+| Alerting (monitoring stack) | Carried entirely by the monitoring stack: `deploy/monitoring/prometheus-rules.yaml` (7 PrometheusRules) + `deploy/monitoring/alertmanager-config.yaml` (routing and grouping; the receiver is a placeholder you replace with your own destination), rolled out with the monitoring stack | Without the rules you only get metrics and K8s events, no active alerting — confirm the rules are deployed before enabling the watchdog |
 
 ## How it works (overview)
 

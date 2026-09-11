@@ -1,77 +1,55 @@
 # Routing for the OOM watchdog alerts (rules in prometheus-rules.yaml).
 #
-# This example targets an Opsgenie-compatible gateway that fans out to an IM
-# channel; the `details` keys below are that gateway's contract, not
-# Alertmanager's. Replace the receiver with whatever your stack uses — only
-# the route matcher (alertname =~ MemoryWatchdog.*) and the severity split
-# are meant to be reused verbatim.
+# The receiver below is a placeholder you are expected to replace; the route
+# is the part worth reusing verbatim. A webhook is used here because it needs
+# no credentials and because Alertmanager's standard payload already carries
+# everything these alerts convey:
+#
+#   labels.severity / .namespace / .pod
+#   annotations.summary / .description / .runbook_url
+#
+# So there is usually nothing to map field by field. If your destination is
+# Opsgenie, PagerDuty, Slack or similar, swap webhookConfigs for that
+# receiver's own config block (opsgenieConfigs, pagerdutyConfigs,
+# slackConfigs) and reference a Secret in this namespace for its credential.
+# Two things are worth carrying over when you do:
+#
+#   * derive the destination's priority from `severity` -- a critical here
+#     means OOM rescue is already degraded, a warning is a capacity signal
+#   * a group can hold several pods, so put the count in the title rather
+#     than silently showing only the first:
+#       {{ (index .Alerts 0).Annotations.summary }}
+#       {{- if gt (len .Alerts) 1 }} (+{{ sub (len .Alerts) 1 }} more pods){{ end }}
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: AlertmanagerConfig
 metadata:
   name: memory-watchdog-alerts
-  labels:
-    alertmanagerConfig: "true"
 spec:
   receivers:
     - name: memory-watchdog-alerts
-      opsgenieConfigs:
-          # Resolved notifications are on: these alerts fire on `increase(...)
-          # > 0` over a trailing window, so "it stopped" is real information
-          # (the node got capacity back, the mount was fixed) and closing the
-          # loop keeps stale criticals out of the channel.
-        - sendResolved: true
-          apiKey:
-            key: OPSGENIE_API_KEY
-            name: opsgenie-key
-          # The group can hold several pods; say so in the title instead of
-          # silently showing only the first one.
-          message: >-
-            {{ (index .Alerts 0).Annotations.summary }}{{ if gt (len .Alerts) 1 }} (+{{ sub (len .Alerts) 1 }} more pods){{ end }}
-          description: '{{ (index .Alerts 0).Annotations.description }}'
-          # Severity drives priority: a critical means OOM rescue is already
-          # degraded, a warning is a capacity/hygiene signal.
-          priority: '{{ if eq (index .Alerts 0).Labels.severity "critical" }}P2{{ else }}P4{{ end }}'
-          details:
-            - key: environment
-              value: "${environment}"
-            - key: namespace
-              value: "{{ (index .Alerts 0).Labels.namespace }}"
-            - key: pod
-              value: "{{ (index .Alerts 0).Labels.pod }}"
-            - key: severity
-              value: "{{ (index .Alerts 0).Labels.severity }}"
-            - key: runbook
-              value: "{{ (index .Alerts 0).Annotations.runbook_url }}"
-            - key: useful_link_url
-              value: "{{ (index .Alerts 0).GeneratorURL }}"
-            - key: alert_category
-              value: "memory_watchdog"
-            - key: alert_source
-              value: "Alertmanager"
-            - key: to_mattermost
-              value: "NO"
-            - key: mattermost_channel
-              value: ""
-            - key: to_wecom
-              value: "NO"
-            - key: wecom_webhook
-              value: ""
-            - key: to_feishu
-              value: "YES"
-            - key: feishu_channel
-              value: "your-alert-channel"
+      webhookConfigs:
+        # REPLACE ME.
+        - url: http://alert-gateway.example.com/alerts
+          # On by default here: these rules fire on `increase(...) > 0` over a
+          # trailing window, so "it stopped" is real information (the node got
+          # capacity back, the broken mount was fixed) and closing the loop
+          # keeps stale criticals out of the channel.
+          sendResolved: true
   route:
     receiver: memory-watchdog-alerts
     matchers:
       - name: alertname
         matchType: "=~"
         value: "MemoryWatchdog.*"
+    # Group per alert per namespace: one notification for an alert affecting
+    # several pods in a namespace, but never one notification spanning
+    # namespaces, because the operator action differs per namespace.
     groupBy: ['alertname', 'namespace']
     repeatInterval: 6h
     routes:
-      # A critical means the target container is running without OOM rescue
-      # right now, and only a human can restore it — remind hourly instead of
-      # every 6h. Warnings keep the parent's quieter cadence.
+      # A critical means a container is running without OOM rescue right now
+      # and only a human can restore it -- remind hourly instead of every 6h.
+      # Warnings keep the parent's quieter cadence.
       - receiver: memory-watchdog-alerts
         matchers:
           - name: severity

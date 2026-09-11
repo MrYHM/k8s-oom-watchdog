@@ -122,7 +122,7 @@ curl <pod-ip>:8090/metrics               # Prometheus 指标
 | Kubernetes 版本 | **≥ 1.33**（EKS ≥ 1.34），`/resize` 子资源与原生 sidecar（initContainer `restartPolicy: Always`）均 GA | watchdog 首次 PATCH 收到 404/405 时打出明确 CRITICAL 日志并退出，反复重启触发 `MemoryWatchdogSidecarRestarting` 告警 |
 | Cgroup | v2（systemd driver，EKS AL2023 默认） | 启动时定位 cgroup 失败并退出 |
 | Pod Security | 命名空间需允许 hostPath 只读挂载（`/sys/fs/cgroup`、`/proc/meminfo`），PSA `restricted` 档位会拒绝 | Pod 无法创建 |
-| 告警（监控栈） | 由监控栈统一承载：`deploy/monitoring/prometheus-rules.yaml`（7 条 PrometheusRule）+ `deploy/monitoring/alertmanager-config.yaml`（经告警网关送达 IM 告警群，示例通道名 your-alert-channel），随监控栈发布生效 | 未部署规则则只有指标与 K8s 事件，无主动告警——启用 watchdog 前必须先确认规则已下发 |
+| 告警（监控栈） | 由监控栈统一承载：`deploy/monitoring/prometheus-rules.yaml`（7 条 PrometheusRule）+ `deploy/monitoring/alertmanager-config.yaml`（路由与聚合规则；接收方是占位符，需替换为你自己的告警去向），随监控栈发布生效 | 未部署规则则只有指标与 K8s 事件，无主动告警——启用 watchdog 前必须先确认规则已下发 |
 
 ## 工作机制（概览）
 
