@@ -79,6 +79,10 @@ Match the file you are editing. Two things are not negotiable:
 
 Keep commits focused, and describe the behaviour change rather than the diff.
 
+`main` is protected: changes land through pull requests, and both CI checks
+(`test` and the multi-arch image build) have to pass. External pull requests
+also need a maintainer approval before they can be merged.
+
 ## Reporting bugs
 
 Use the [issue templates](.github/ISSUE_TEMPLATE). For anything
