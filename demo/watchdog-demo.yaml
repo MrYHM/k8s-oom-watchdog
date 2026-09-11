@@ -37,6 +37,11 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # The client emits through the newer Events API; without this every event
+  # the watchdog raises is rejected with 403 and only kubelet events show up.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -96,9 +101,10 @@ spec:
               value: "0.8"
             - name: WATCHDOG_INTERVAL
               value: "0.1"
-            # Small steps keep the demo legible: 256Mi -> 384 -> 512 -> ...
+            # Step sized so each level buys ~4s at the stress rate below --
+            # comfortably more than the detect + PATCH + kubelet apply latency.
             - name: WATCHDOG_STEP
-              value: "128Mi"
+              value: "192Mi"
             # cap = 4 x 256Mi = 1Gi, comfortably above the 700Mi the stress
             # tool asks for, so the rescue succeeds instead of hitting the cap.
             - name: WATCHDOG_MAX_FACTOR

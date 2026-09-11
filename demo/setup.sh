@@ -18,6 +18,11 @@ DEFAULT_IMAGE="ghcr.io/mryhm/k8s-oom-watchdog:edge"
 IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
 PULL_POLICY="${PULL_POLICY:-Always}"
 ARCH="${ARCH:-}"
+# The target container only needs a python3 interpreter. Override when the
+# cluster cannot reach Docker Hub -- the watchdog image itself is built on
+# python:3.12-slim, so it doubles as the workload image.
+DEFAULT_WORKLOAD_IMAGE="python:3.12-slim"
+WORKLOAD_IMAGE="${WORKLOAD_IMAGE:-$DEFAULT_WORKLOAD_IMAGE}"
 
 command -v kubectl >/dev/null || { echo "kubectl not found"; exit 1; }
 
@@ -30,6 +35,7 @@ echo "==> Cluster is v1.${minor}, in-place resize available."
 
 echo "==> Applying the demo manifest (image: $IMAGE)"
 sed -e "s|image: $DEFAULT_IMAGE|image: $IMAGE|" \
+    -e "s|image: $DEFAULT_WORKLOAD_IMAGE|image: $WORKLOAD_IMAGE|" \
     -e "s|imagePullPolicy: Always|imagePullPolicy: $PULL_POLICY|" \
     "$HERE/watchdog-demo.yaml" | kubectl apply -f -
 
@@ -39,10 +45,30 @@ if [ -n "$ARCH" ]; then
     -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/arch\":\"$ARCH\"}}}}}"
 fi
 
-echo "==> Waiting for the pod to become ready (pulling two images)"
-kubectl -n "$NS" wait --for=condition=Ready pod -l app=bursty-worker --timeout=300s
+# rollout status, not `wait pod`: patching the deployment (ARCH) rolls out a
+# new ReplicaSet, and a label selector during the handover can return the pod
+# that is on its way out.
+echo "==> Waiting for the rollout to settle (pulling images)"
+kubectl -n "$NS" rollout status deployment/bursty-worker --timeout=300s
 
-POD="$(kubectl -n "$NS" get pod -l app=bursty-worker -o jsonpath='{.items[0].metadata.name}')"
+# Pick a pod that is Running and not being torn down: during a rollout (or
+# right after deleting a pod) the selector also returns the one on its way
+# out, and every later step would then fail with NotFound.
+POD=""
+for _ in $(seq 1 60); do
+  POD="$(kubectl -n "$NS" get pod -l app=bursty-worker -o json | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items", [])
+live = [p for p in items
+        if not p["metadata"].get("deletionTimestamp")
+        and p.get("status", {}).get("phase") == "Running"
+        and all(c.get("ready") for c in p.get("status", {}).get("containerStatuses", []) or [])]
+print(live[0]["metadata"]["name"] if live else "")
+')"
+  [ -n "$POD" ] && break
+  sleep 2
+done
+[ -n "$POD" ] || { echo "No running bursty-worker pod found" >&2; exit 1; }
 echo "==> Pod: $POD"
 
 echo "==> Copying the stress tool into the target container"
