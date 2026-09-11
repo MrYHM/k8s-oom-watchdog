@@ -28,16 +28,13 @@ Design decisions (see README.md for rationale):
 import dataclasses
 import glob
 import http.server
-import json
 import logging
 import os
-import queue
 import random
 import signal
 import sys
 import threading
 import time
-import urllib.request
 from typing import Dict, Optional, Tuple
 
 try:
@@ -617,105 +614,6 @@ class PodApi:
 
 
 # ---------------------------------------------------------------------------
-# Feishu notifier (dedicated thread; never blocks the monitoring loop)
-# ---------------------------------------------------------------------------
-class FeishuNotifier(threading.Thread):
-    HTTP_TIMEOUT = 5.0
-    TOKEN_REFRESH_MARGIN = 300.0
-
-    def __init__(self, cooldown_seconds: float = 300.0) -> None:
-        super().__init__(name="feishu-notifier", daemon=True)
-        self.app_id = os.environ.get("FEISHU_APP_ID", "")
-        self.app_secret = os.environ.get("FEISHU_APP_SECRET", "")
-        self.chat_id = os.environ.get("FEISHU_CHAT_ID", "")
-        self.enabled = bool(self.app_id and self.app_secret and self.chat_id)
-        self.pod_name = os.environ.get("POD_NAME", "unknown-pod")
-        self.pod_namespace = os.environ.get("POD_NAMESPACE", "unknown-ns")
-        self.cooldown_seconds = cooldown_seconds
-        self._queue: "queue.Queue[Tuple[str, str, str]]" = queue.Queue(maxsize=100)
-        self._last_sent: Dict[str, float] = {}
-        self._token: Optional[str] = None
-        self._token_expiry = 0.0
-        if not self.enabled:
-            logger.info("Feishu credentials not fully configured; notifications disabled.")
-
-    def notify(self, event_key: str, title: str, color: str, markdown: str) -> None:
-        """Enqueue a card; same event_key is rate-limited to one per cooldown."""
-        if not self.enabled:
-            return
-        now = time.monotonic()
-        if now - self._last_sent.get(event_key, float("-inf")) < self.cooldown_seconds:
-            logger.debug("Feishu event '%s' suppressed by cooldown.", event_key)
-            return
-        try:
-            self._queue.put_nowait((title, color, markdown))
-        except queue.Full:
-            logger.warning("Feishu notification queue full; dropping event '%s'.", event_key)
-            return
-        # Recorded only after a successful enqueue: a dropped event must not
-        # consume the cooldown window and silence its retry.
-        self._last_sent[event_key] = now
-
-    def run(self) -> None:
-        while True:
-            title, color, markdown = self._queue.get()
-            try:
-                self._send_card(title, color, markdown)
-            except Exception as e:  # notifier must never kill the process
-                logger.warning("Error sending Feishu card '%s': %s", title, e)
-
-    def _post_json(self, url: str, payload: dict, token: Optional[str] = None) -> dict:
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        req = urllib.request.Request(
-            url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
-        )
-        # Default (verified) TLS context on purpose: the payload carries app
-        # credentials, never disable certificate validation here.
-        with urllib.request.urlopen(req, timeout=self.HTTP_TIMEOUT) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    def _get_token(self) -> Optional[str]:
-        if self._token and time.monotonic() < self._token_expiry - self.TOKEN_REFRESH_MARGIN:
-            return self._token
-        res = self._post_json(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            {"app_id": self.app_id, "app_secret": self.app_secret},
-        )
-        if res.get("code") != 0:
-            logger.warning("Failed to fetch Feishu tenant_access_token: %s", res)
-            return None
-        self._token = res.get("tenant_access_token")
-        self._token_expiry = time.monotonic() + float(res.get("expire", 3600))
-        return self._token
-
-    def _send_card(self, title: str, color: str, markdown: str) -> None:
-        token = self._get_token()
-        if not token:
-            return
-        annotated = (
-            f"**命名空间:** `{self.pod_namespace}`\n"
-            f"**Pod 实例:** `{self.pod_name}`\n"
-            f"**时间:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"----------------------------------------\n"
-            f"{markdown}"
-        )
-        card = {
-            "config": {"wide_screen_mode": True, "enable_forward": True},
-            "header": {"title": {"tag": "plain_text", "content": title}, "template": color},
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": annotated}}],
-        }
-        res = self._post_json(
-            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
-            {"receive_id": self.chat_id, "msg_type": "interactive", "content": json.dumps(card)},
-            token=token,
-        )
-        if res.get("code") != 0:
-            logger.warning("Failed to send Feishu interactive card: %s", res)
-
-
-# ---------------------------------------------------------------------------
 # Prometheus metrics + liveness endpoint (stdlib-only)
 # ---------------------------------------------------------------------------
 class Heartbeat:
@@ -848,7 +746,7 @@ class Watchdog:
     PENDING_CHECK_INTERVAL = 2.0  # rate limit for resize-condition polls
     BLOCKED_PATH_SLEEP = 10.0     # back-off while a scale-up stays blocked
 
-    def __init__(self, cfg: Config, api: PodApi, notifier: FeishuNotifier,
+    def __init__(self, cfg: Config, api: PodApi,
                  metrics: Metrics, heartbeat: Heartbeat, target_dir: str,
                  pod_slice: str, baseline: int, fatal_fn, *,
                  baseline_requests: Optional[str] = None,
@@ -860,7 +758,6 @@ class Watchdog:
                  jitter_fn=None) -> None:
         self.cfg = cfg
         self.api = api
-        self.notifier = notifier
         self.metrics = metrics
         self.heartbeat = heartbeat
         self.target_dir = target_dir
@@ -941,10 +838,6 @@ class Watchdog:
                 )
             action = "缩容" if is_down else "扩容"
             logger.error("Resize PATCH rejected (status %s): %s", e.status, e.body)
-            self.notifier.notify(
-                "patch-rejected", f"💥 原地{action}请求被拒绝", "red",
-                f"K8s API 异常 (Status {e.status}):\n```\n{e.body}\n```",
-            )
             self.api.emit_event("ResizeFailed",
                                 f"Resize PATCH to {target_str} rejected by API (status {e.status})",
                                 event_type="Warning")
@@ -953,7 +846,6 @@ class Watchdog:
             return False
         except Exception as e:
             logger.error("Resize PATCH failed with unexpected error: %s", e)
-            self.notifier.notify("patch-error", "💥 原地扩缩容网络异常", "red", f"`{e}`")
             self.metrics.inc("watchdog_resize_failed_total", {"stage": "patch"})
             self.circuit_open_until = self._now() + 60
             return False
@@ -989,14 +881,6 @@ class Watchdog:
             self.requests_current = cgroup_max
         except Exception as e:
             logger.error("Rollback PATCH failed (spec and cgroup now diverge): %s", e)
-        self.notifier.notify(
-            "resize-failed", "🔴 [高危] 原地扩容未能生效", "red",
-            f"**原因:** {reason}\n"
-            f"**期望配额:** `{bytes_to_k8s_str(target)}`\n"
-            f"**实际配额:** `{bytes_to_k8s_str(cgroup_max)}`\n"
-            f"**处置:** spec 已回滚，{int(self.cfg.circuit_cooldown / 60)} 分钟内暂停扩容。"
-            f"若为节点容量不足，请扩容节点或横向分流。",
-        )
         self.api.emit_event(
             "ResizeFailed",
             f"In-place resize to {bytes_to_k8s_str(target)} did not apply ({reason}); "
@@ -1067,13 +951,6 @@ class Watchdog:
             action = "自动回缩" if is_down else "原地垂直扩容"
             logger.info("SUCCESS: kubelet applied the in-place resize; limit is now %s.",
                         bytes_to_k8s_str(cgroup_max))
-            self.notifier.notify(
-                f"resize-ok-{'down' if is_down else 'up'}",
-                f"✨ Kubelet 原地{action}生效", "blue" if is_down else "green",
-                f"🎉 **原地资源调整已在内核生效！**\n\n"
-                f"**变更类型:** `{action}`\n"
-                f"**生效 Cgroup 限额:** `{bytes_to_k8s_str(cgroup_max)}`",
-            )
             self.api.emit_event(
                 "ResizeApplied",
                 f"In-place {'scale-down' if is_down else 'scale-up'} applied by "
@@ -1152,11 +1029,6 @@ class Watchdog:
                 # a metric + notification, not just a log line.
                 logger.error("Failed to fetch pod spec: %s", e)
                 self.metrics.inc("watchdog_spec_read_errors_total")
-                self.notifier.notify(
-                    "spec-read-failed", "🔴 [高危] 内存高压期间无法读取 pod spec", "red",
-                    f"扩容决策被阻塞，读取 pod spec 失败：`{e}`\n"
-                    "若 API Server 持续不可用，OOM 抢救将无法执行。",
-                )
                 return
         if self.spec_limit != cgroup_max:
             # spec > cgroup: an earlier scale-up is still being applied.
@@ -1182,11 +1054,6 @@ class Watchdog:
         if decision.action == Action.BLOCKED_NO_HOST_STATS:
             logger.critical("Host memory stats unavailable; scale-up refused. "
                             "Check the /host/proc/meminfo hostPath mount!")
-            self.notifier.notify(
-                "no-host-stats", "🔴 [高危] 看门狗失去宿主机视野", "red",
-                "无法读取宿主机内存信息，安全校验无法执行，扩容已被拒绝。\n"
-                "请检查 `/host/proc/meminfo` hostPath 挂载。此状态下看门狗**无法抢救 OOM**。",
-            )
             self.api.emit_event("WatchdogBlind",
                                 "Host memory stats unavailable; scale-up refused and "
                                 "OOM rescue is inoperative", event_type="Warning")
@@ -1194,11 +1061,6 @@ class Watchdog:
             self._sleep(self.BLOCKED_PATH_SLEEP)
             return
         if decision.action == Action.BLOCKED_MAX_LIMIT:
-            self.notifier.notify(
-                "max-limit", "❌ 扩容达到集群配额上限", "orange",
-                f"**当前配额:** `{bytes_to_k8s_str(self.spec_limit)}`\n"
-                f"**拦截原因:** 已达集群声明的最大容忍上限 (`{bytes_to_k8s_str(self.cfg.max_limit_bytes)}`)。",
-            )
             self.api.emit_event("ScaleUpBlocked",
                                 f"Memory pressure at {bytes_to_k8s_str(self.spec_limit)} but the "
                                 f"cluster cap ({bytes_to_k8s_str(self.cfg.max_limit_bytes)}) is reached",
@@ -1208,10 +1070,6 @@ class Watchdog:
             return
         if decision.action == Action.BLOCKED_HOST_FULL:
             logger.critical("HOST CAPACITY EXHAUSTED: %s", decision.reason)
-            self.notifier.notify(
-                "host-full", "🔴 [高危] 宿主机内存枯竭，扩容熔断", "red",
-                f"{decision.reason}\n**决策:** 拒绝扩容，守护节点稳定。请扩容节点或横向分流。",
-            )
             self.api.emit_event("ScaleUpBlocked",
                                 f"Scale-up refused to protect the node: {decision.reason}",
                                 event_type="Warning")
@@ -1241,20 +1099,12 @@ class Watchdog:
 
         target = recheck.target_bytes
         if recheck.action == Action.SCALE_UP_ADAPTIVE:
-            self.notifier.notify(
-                "adaptive-step", "⚠️ 触发宿主机容量自适应降级扩容", "orange",
-                f"**原因:** {recheck.reason}\n"
-                f"**原地垂直扩容计划:** `{bytes_to_k8s_str(self.spec_limit)}` ──► `{bytes_to_k8s_str(target)}`",
-            )
+            # Host headroom forced a smaller step than configured. Worth its
+            # own line: the reason names which constraint bound the step, and
+            # the generic rescue log below does not distinguish the two paths.
+            logger.warning("Adaptive step-down: %s", recheck.reason)
         logger.info("TRIGGERING OOM RESCUE: in-place resize %s -> %s",
                     bytes_to_k8s_str(self.spec_limit), bytes_to_k8s_str(target))
-        self.notifier.notify(
-            "scale-up", "🚨 [OOM 紧急抢救] 触发原地垂直扩容", "red",
-            f"**容器工作集:** `{working_set / MIB:.1f}MB` / `{cgroup_max / MIB:.1f}MB` "
-            f"(`{working_set * 100.0 / cgroup_max:.1f}%`)\n"
-            f"**原地垂直扩容申请:** `{bytes_to_k8s_str(self.spec_limit)}` ──► `{bytes_to_k8s_str(target)}`\n"
-            f"（requests 与 limits 同步调整，借用内存全程纳入调度器记账）",
-        )
         old_limit = self.spec_limit
         if self.do_patch(target, is_down=False):
             self.last_scale_up = now
@@ -1335,13 +1185,6 @@ class Watchdog:
             logger.info("COOLDOWN ELAPSED: restoring original requests %s "
                         "(limit stays at %s)",
                         self.baseline_requests, bytes_to_k8s_str(cgroup_max))
-            self.notifier.notify(
-                "requests-restore", "📉 [资源回交] 恢复初始 requests", "blue",
-                f"扩容失败回滚后 requests 曾如实抬升至 `{bytes_to_k8s_str(cgroup_max)}`；"
-                f"工作集已稳定处于低水位 `{working_set / MIB:.1f}MB` 超过 "
-                f"{int(now - self.low_since)}s，恢复初始 requests "
-                f"`{self.baseline_requests}`（limit 不变）。",
-            )
             if self.do_patch(target, is_down=True):
                 self.metrics.inc("watchdog_requests_restored_total")
                 self.api.emit_event(
@@ -1355,12 +1198,6 @@ class Watchdog:
             return
         logger.info("COOLDOWN ELAPSED: scaling down %s -> %s",
                     bytes_to_k8s_str(cgroup_max), bytes_to_k8s_str(target))
-        self.notifier.notify(
-            "scale-down", "📉 [资源回交] 触发容器自动原地缩容", "blue",
-            f"工作集已稳定处于低水位 `{working_set / MIB:.1f}MB` 超过 "
-            f"{int(now - self.low_since)}s，防抖期满。\n"
-            f"**就地缩容回退:** `{bytes_to_k8s_str(cgroup_max)}` ──► `{bytes_to_k8s_str(target)}`",
-        )
         if self.do_patch(target, is_down=True):
             self.metrics.inc("watchdog_scale_down_total")
             self.api.emit_event(
@@ -1378,15 +1215,11 @@ def main() -> None:
     pod_namespace = os.environ.get("POD_NAMESPACE")
     pod_uid = os.environ.get("POD_UID")
 
-    notifier = FeishuNotifier()
-    notifier.start()
     metrics = Metrics()
     heartbeat = Heartbeat()
 
     def fatal(message: str) -> None:
         logger.critical(message)
-        notifier.notify("fatal", "💥 Watchdog 启动/运行失败", "red", message)
-        time.sleep(3)  # give the notifier thread a chance to flush
         sys.exit(1)
 
     # The liveness probe targets /healthz on this server: without it the
@@ -1510,7 +1343,7 @@ def main() -> None:
                 bytes_to_k8s_str(cfg.max_limit_bytes), cfg.max_factor)
 
     watchdog_loop = Watchdog(
-        cfg, api, notifier, metrics, heartbeat,
+        cfg, api, metrics, heartbeat,
         target_dir=target_dir, pod_slice=pod_slice, baseline=baseline,
         baseline_requests=baseline_req_str,
         current_requests=current_req_str,

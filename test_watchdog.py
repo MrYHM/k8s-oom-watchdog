@@ -9,7 +9,6 @@ cgroup/file parsing helpers against temp directories.
 """
 
 import os
-import queue
 import shutil
 import socket
 import sys
@@ -399,21 +398,13 @@ class FakeApi:
         self.events.append((reason, event_type))
 
 
-class FakeNotifier:
-    def __init__(self):
-        self.cards = []
-
-    def notify(self, event_key, title, color, markdown):
-        self.cards.append(event_key)
-
-
 def make_watchdog(read_fn, api=None, clock=None, host=(32 * GIB, 20 * GIB),
                   find_dir=None, baseline=2 * GIB, baseline_requests=None,
                   current_requests=None, **cfg_overrides):
     api = api or FakeApi()
     clock = clock or FakeClock()
     wd = watchdog.Watchdog(
-        make_cfg(**cfg_overrides), api, FakeNotifier(), watchdog.Metrics(),
+        make_cfg(**cfg_overrides), api, watchdog.Metrics(),
         watchdog.Heartbeat(),
         target_dir="/fake/pod/app.scope", pod_slice="/fake/pod",
         baseline=baseline, baseline_requests=baseline_requests,
@@ -566,16 +557,15 @@ class TestWatchdogStateMachine(unittest.TestCase):
         self.assertIsNone(wd.pending)
         self.assertIn(("ResizeApplied", "Normal"), api.events)
 
-    def test_spec_read_failure_alerts_and_counts(self):
+    def test_spec_read_failure_counts(self):
         # Losing the API server while memory is critical means OOM rescue is
-        # inoperative; that must surface as a metric and a notification, not
-        # just a log line.
+        # inoperative; that must surface as a metric an alert can fire on,
+        # not just a log line.
         api = FakeApi()
         api.get_pod_error = RuntimeError("apiserver down")
         wd, api, clock = make_watchdog(lambda p: (int(1.9 * GIB), 2 * GIB), api=api)
         wd.tick()
         self.assertEqual(api.patches, [])
-        self.assertIn("spec-read-failed", wd.notifier.cards)
         self.assertIn("watchdog_spec_read_errors_total", wd.metrics.render())
 
     def test_withdraw_patch_failure_keeps_supervising(self):
@@ -867,18 +857,6 @@ class TestMetricsServer(unittest.TestCase):
                 watchdog.start_metrics_server(watchdog.Metrics(), port)
         finally:
             blocker.close()
-
-
-class TestFeishuCooldown(unittest.TestCase):
-    def test_queue_full_drop_does_not_consume_cooldown(self):
-        n = watchdog.FeishuNotifier(cooldown_seconds=300.0)
-        n.enabled = True
-        n._queue = queue.Queue(maxsize=1)
-        n._queue.put_nowait(("t", "c", "m"))  # fill the queue
-        n.notify("k", "t", "red", "m")        # dropped: queue full
-        n._queue.get_nowait()                 # queue drains
-        n.notify("k", "t", "red", "m")        # must not be cooldown-suppressed
-        self.assertEqual(n._queue.qsize(), 1)
 
 
 class TestPodApiEvents(unittest.TestCase):
