@@ -44,6 +44,13 @@ straight into the node):
 IMAGE=<your-registry>/oom-watchdog:demo ./setup.sh
 ```
 
+On a cluster with mixed node architectures, a single-arch image also needs
+`ARCH` so the pod cannot land on a node it was never built for:
+
+```bash
+ARCH=arm64 IMAGE=<your-registry>/oom-watchdog:demo ./setup.sh
+```
+
 `demo.sh` prints one line per second from the watchdog's own `/metrics`, so
 the working set is the same number its decisions use (page cache already
 subtracted):

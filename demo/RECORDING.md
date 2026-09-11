@@ -64,7 +64,9 @@ Pick one:
       # Match your node architecture; --platform can list both.
       docker buildx build --platform linux/arm64 \
         -t $REGISTRY/oom-watchdog:demo --push .
-      IMAGE=$REGISTRY/oom-watchdog:demo ./setup.sh
+      # ARCH is required when the image is single-arch and the cluster has
+      # mixed nodes, or the pod may land where the image cannot run.
+      ARCH=arm64 IMAGE=$REGISTRY/oom-watchdog:demo ./setup.sh
       ```
 - [ ] **kind only**: `docker build -t oom-watchdog:demo . && kind load
       docker-image oom-watchdog:demo`, then set `image: oom-watchdog:demo` and
@@ -172,6 +174,7 @@ agg --speed 1.5 --font-size 16 --theme asciinema demo.cast demo.gif
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ImagePullBackOff` | Private GHCR package, no pull secret | Step 2 |
+| `no matching manifest for linux/amd64` | Single-arch image on a mixed-architecture cluster | `ARCH=arm64 ./setup.sh`, or rebuild with both platforms |
 | Pod stuck `Init:0/1` | Sidecar crash-looping | `kubectl logs <pod> -c watchdog` — CRITICAL line says which prerequisite failed |
 | `Could not locate the pod cgroup slice` | Nested cgroups (kind/minikube), or cgroup v1 | Use a real node; confirm cgroup v2 with `stat -fc %T /sys/fs/cgroup` (expect `cgroup2fs`) |
 | `LIMIT` column empty | Port-forward or curl failed | Check `curl -s localhost:18090/metrics`; the port-forward runs in the background of `demo.sh` |

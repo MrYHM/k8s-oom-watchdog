@@ -11,9 +11,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   IMAGE=<account>.dkr.ecr.<region>.amazonaws.com/oom-watchdog:demo ./setup.sh
 # PULL_POLICY=IfNotPresent is what you want for a locally loaded image
 # (kind load / minikube image load).
+# ARCH pins the demo to nodes of one architecture. Needed when your image
+# is single-arch but the cluster has mixed nodes -- otherwise the pod can
+# land on a node the image was never built for.
 DEFAULT_IMAGE="ghcr.io/mryhm/k8s-oom-watchdog:edge"
 IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
 PULL_POLICY="${PULL_POLICY:-Always}"
+ARCH="${ARCH:-}"
 
 command -v kubectl >/dev/null || { echo "kubectl not found"; exit 1; }
 
@@ -28,6 +32,12 @@ echo "==> Applying the demo manifest (image: $IMAGE)"
 sed -e "s|image: $DEFAULT_IMAGE|image: $IMAGE|" \
     -e "s|imagePullPolicy: Always|imagePullPolicy: $PULL_POLICY|" \
     "$HERE/watchdog-demo.yaml" | kubectl apply -f -
+
+if [ -n "$ARCH" ]; then
+  echo "==> Pinning the demo to $ARCH nodes"
+  kubectl -n "$NS" patch deployment bursty-worker --type=merge \
+    -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/arch\":\"$ARCH\"}}}}}"
+fi
 
 echo "==> Waiting for the pod to become ready (pulling two images)"
 kubectl -n "$NS" wait --for=condition=Ready pod -l app=bursty-worker --timeout=300s
