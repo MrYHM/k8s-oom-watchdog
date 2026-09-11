@@ -48,5 +48,5 @@ py-modules = ["watchdog"]
 
 [project.urls]
 Homepage = "https://github.com/MrYHM/k8s-oom-watchdog"
-Documentation = "https://github.com/MrYHM/k8s-oom-watchdog/blob/master/docs/design.md"
+Documentation = "https://github.com/MrYHM/k8s-oom-watchdog/blob/main/docs/design.md"
 Issues = "https://github.com/MrYHM/k8s-oom-watchdog/issues"

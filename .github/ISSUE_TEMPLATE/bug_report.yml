@@ -93,5 +93,5 @@ body:
       options:
         - label: I checked the four items above
           required: true
-        - label: I read the [known limitations](https://github.com/MrYHM/k8s-oom-watchdog/blob/master/docs/design.md#known-limitations-with-reasoning) — in particular that a burst allocating faster than the rescue path can absorb will still OOM, by design
+        - label: I read the [known limitations](https://github.com/MrYHM/k8s-oom-watchdog/blob/main/docs/design.md#known-limitations-with-reasoning) — in particular that a burst allocating faster than the rescue path can absorb will still OOM, by design
           required: true
