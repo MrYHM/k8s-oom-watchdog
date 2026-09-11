@@ -1,0 +1,191 @@
+# Injecting the watchdog into a Deployment.
+#
+# A complete, applyable manifest -- deploy it as-is to see the pattern work,
+# then fold the marked pieces into your own workload. Everything the watchdog
+# needs is here except RBAC, which lives in rbac.yaml (apply that first).
+#
+# Replace throughout:
+#   my-namespace   your namespace
+#   my-worker      your workload and its main container
+#
+# Requires Kubernetes >= 1.33 (pods/resize and native sidecars are GA there)
+# and a namespace that permits read-only hostPath mounts -- the PSA
+# "restricted" profile rejects them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-worker
+  namespace: my-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-worker
+  template:
+    metadata:
+      labels:
+        # (1) The ValidatingAdmissionPolicy in admission-policy.yaml keys off
+        #     this label. Keep it in sync there if you rename it.
+        app: my-worker
+    spec:
+      # (2) The watchdog's ServiceAccount (see rbac.yaml). automount is off so
+      #     its token is NOT handed to the main container: the token can patch
+      #     pods/resize namespace-wide, and only the watchdog should hold it.
+      #     It reaches the sidecar through the projected volume at (8).
+      serviceAccountName: my-worker-watchdog
+      automountServiceAccountToken: false
+
+      initContainers:
+        # (3) A native sidecar: an initContainer with restartPolicy: Always.
+        #     It starts before the main container and terminates after it, so
+        #     the entire workload lifecycle -- including a long
+        #     terminationGracePeriodSeconds drain -- stays supervised. If it
+        #     crashes, the kubelet restarts it independently of the workload.
+        - name: watchdog
+          image: ghcr.io/mryhm/k8s-oom-watchdog:latest   # pin a version in production
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          env:
+            # (4) The downward API values are required; the watchdog exits at
+            #     startup without POD_NAME and POD_NAMESPACE.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            # (5) Which container to supervise. Must match the name at (9).
+            - name: WATCHDOG_TARGET_CONTAINER
+              value: "my-worker"
+            # Scale up once the working set reaches this fraction of the limit.
+            - name: WATCHDOG_THRESHOLD
+              value: "0.8"
+            # cgroup sampling period, seconds.
+            - name: WATCHDOG_INTERVAL
+              value: "0.1"
+            # How much to add per scale-up. Size it so one step buys more time
+            # than detect + PATCH + kubelet-apply takes (seconds), or bursts
+            # will outrun the rescue.
+            - name: WATCHDOG_STEP
+              value: "2Gi"
+            # Cap = this factor x the container's own starting limit, so one
+            # value adapts to every size of workload. Must be > 1.0.
+            - name: WATCHDOG_MAX_FACTOR
+              value: "2.0"
+            # Host red line: a scale-up is allowed only while the new limit
+            # plus everything else on the node stays under this fraction of
+            # physical memory.
+            - name: WATCHDOG_HOST_CEILING
+              value: "0.90"
+            # Keep off: when host memory stats are unreadable the safety check
+            # cannot be evaluated, and scaling up blind is rarely what you want.
+            - name: WATCHDOG_ALLOW_BLIND_SCALEUP
+              value: "false"
+            - name: WATCHDOG_METRICS_PORT
+              value: "8090"
+          ports:
+            - name: metrics
+              containerPort: 8090
+          # (6) /healthz is driven by the main loop's heartbeat, so it goes 503
+          #     if the loop stalls even while the HTTP thread is alive.
+          #     Liveness only, deliberately no readinessProbe: a native
+          #     sidecar's readiness gates the whole pod, and a watchdog restart
+          #     must not mark your workload unready.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # (7) A pure-Python process reading read-only mounts needs no
+          #     privileges at all.
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # Resident footprint is a constant ~70Mi and does not grow with the
+          # supervised container. Never exec a kubernetes-importing script in
+          # here -- a second interpreter blows this limit.
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          volumeMounts:
+            - mountPath: /host/sys/fs/cgroup
+              name: host-cgroup
+              readOnly: true
+            - mountPath: /host/proc/meminfo
+              name: host-proc-meminfo
+              readOnly: true
+            # (8) The projected token, mounted only into this container.
+            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              name: watchdog-sa-token
+              readOnly: true
+
+      containers:
+        # (9) Your workload, unchanged except for resizePolicy and the
+        #     starting limit.
+        - name: my-worker
+          image: my-registry/my-worker:latest
+          # (10) REQUIRED. Without restartPolicy: NotRequired for memory the
+          #      kubelet restarts the container on every resize, which defeats
+          #      the entire point.
+          resizePolicy:
+            - resourceName: memory
+              restartPolicy: NotRequired
+          resources:
+            requests:
+              cpu: 500m
+              # (11) This starting limit is the baseline the watchdog records
+              #      and returns to. With WATCHDOG_MAX_FACTOR 2.0 it may borrow
+              #      up to 16Gi during a burst.
+              memory: 8Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+
+      volumes:
+        # (12) Read-only host mounts: the cgroup tree to sample the target's
+        #      working set, and meminfo for the host red-line check.
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: host-proc-meminfo
+          hostPath:
+            path: /proc/meminfo
+            type: File
+        # (13) A projected token instead of the default automount, so only the
+        #      watchdog container can reach the API server.
+        - name: watchdog-sa-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace

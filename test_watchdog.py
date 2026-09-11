@@ -635,7 +635,7 @@ class TestWatchdogStateMachine(unittest.TestCase):
 
 class TestResolveMaxLimit(unittest.TestCase):
     """Cap derivation: the cap is ALWAYS factor x baseline (no absolute cap
-    exists), so one chart-wide parameter adapts to every deployment tier. Runtime borrowing is still bounded by the host ceiling and kubelet
+    exists), so one parameter adapts to workloads of every size. Runtime borrowing is still bounded by the host ceiling and kubelet
     allocatable admission."""
 
     def test_factor_scales_baseline(self):
@@ -665,10 +665,9 @@ class TestResolveMaxLimit(unittest.TestCase):
 
 
 class TestConfigDefaults(unittest.TestCase):
-    """The chart, values example and docs all state a 90% host red line. A
-    container started without WATCHDOG_HOST_CEILING (the demo, or anyone not
-    using the chart) must agree with them, so the default is asserted here
-    instead of only living in a comment."""
+    """The examples and docs all state a 90% host red line, so a container
+    started without WATCHDOG_HOST_CEILING must agree with them. Asserted here
+    rather than left living in a comment."""
 
     def test_host_ceiling_default_is_90_percent(self):
         self.assertEqual(watchdog.Config().host_ceiling, 0.90)

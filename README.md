@@ -9,7 +9,7 @@
 
 A **workload-agnostic** container memory watchdog sidecar for any long-running, memory-bursty workload (batch jobs, data imports, report aggregation, Celery/RQ workers, ETL tasks, …): it samples the target container's cgroup v2 **working-set memory** at high frequency and, before the kernel OOM-killer fires, raises the memory limit via Kubernetes **in-place pod resize** (the `/resize` subresource), then shrinks it back once the burst is over — without ever restarting the container or interrupting long-running tasks.
 
-Which container to supervise is set by the `WATCHDOG_TARGET_CONTAINER` environment variable (chart parameter `targetContainer`), fully decoupled from the business stack. This document and the example templates use `heavy-worker` (a Celery heavy worker, the project's original use case) as the target container.
+Which container to supervise is set by the `WATCHDOG_TARGET_CONTAINER` environment variable, fully decoupled from the business stack. The docs and [`examples/`](examples/) use `my-worker` as the placeholder target container; the design pressure came from a Celery heavy worker, which is why bursty long-running batch work runs through the examples.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ Which container to supervise is set by the `WATCHDOG_TARGET_CONTAINER` environme
 flowchart LR
   subgraph pod["Pod"]
     W["watchdog<br/>(native sidecar)"]
-    T["target container<br/>heavy-worker"]
+    T["target container<br/>my-worker"]
   end
   subgraph node["Node"]
     CG["cgroup v2<br/>memory.current / memory.stat"]
@@ -100,7 +100,21 @@ docker build -t <your-registry>/memory-watchdog:<tag> .
 
 The image pip-installs a pinned `kubernetes` client (the resize-subresource methods require ≥ 33; older versions fall back to the raw-API path).
 
-**2. Port the deployment templates**: `deploy/helm/` ships everything the watchdog injection needs (the Deployment sidecar fragment, RBAC, ValidatingAdmissionPolicy, ServiceMonitor) plus a values example — they reference the source chart's template helpers, so replace those per [deploy/README.md](deploy/README.md) when porting into your chart; the alerting rules (`deploy/monitoring/`) roll out with your monitoring stack.
+**2. Copy an example**: [`examples/`](examples/) holds complete, applyable
+manifests — the sidecar injected into a [Deployment](examples/deployment-with-sidecar.yaml)
+or a [Job](examples/job-with-sidecar.yaml), plus [RBAC](examples/rbac.yaml), an
+optional [admission policy](examples/admission-policy.yaml) and a
+[ServiceMonitor](examples/servicemonitor.yaml). Every piece is annotated, and
+the placeholders are just your namespace and container name:
+
+```bash
+sed -e 's/my-namespace/prod/g' -e 's/my-worker/report-builder/g' \
+  examples/rbac.yaml examples/deployment-with-sidecar.yaml | kubectl apply -f -
+```
+
+There is no Helm chart on purpose — a sidecar has nothing to install on its
+own, it lives inside your workload. Alerting rules ship separately with your
+monitoring stack (`deploy/monitoring/`).
 
 **3. Enable**: once every prerequisite below is met, set `watchdog.enabled: true` and deploy. To verify:
 
@@ -151,7 +165,7 @@ worker:
     tag: "v1.8"
 ```
 
-Alerting is not configured in the chart — it is rolled out by the monitoring stack (see the Prerequisites table). The scale-up cap has exactly one mode, `maxMemoryFactor × baseline`; an absolute cap is deliberately not provided (see the trade-off discussion in [docs/design.md](docs/design.md#design-trade-off-the-scale-up-cap)).
+Alerting is not part of the workload manifests — it is rolled out by the monitoring stack (see the Prerequisites table). The scale-up cap has exactly one mode, `maxMemoryFactor × baseline`; an absolute cap is deliberately not provided (see the trade-off discussion in [docs/design.md](docs/design.md#design-trade-off-the-scale-up-cap)).
 
 ## Known limitations (summary)
 
@@ -175,19 +189,19 @@ The full reasoning behind each item lives in **[docs/design.md](docs/design.md#k
 | Alert `MemoryWatchdogHostStatsUnreadable` | `/host/proc/meminfo` mount is broken, so the host safety check cannot run | Check the hostPath mount and node health; no scale-up is performed in this state and the container has no OOM rescue |
 | Alert `MemoryWatchdogHostMemoryExhausted` | The node as a whole is congested; no safe headroom | Add nodes; this is by-design protection |
 | Alert `MemoryWatchdogScaleUpBlockedAtCap` | Memory pressure persists but the cap (factor × baseline) is reached | If chronic, raise that tenant's baseline or maxMemoryFactor |
-| Alert `MemoryWatchdogSidecarRestarting` | Sidecar restarting repeatedly (prerequisites unmet / port taken / persistent main-loop errors / own OOM) | Read the container log's CRITICAL lines; meanwhile the heavy worker's ceiling stays at baseline with no OOM rescue |
+| Alert `MemoryWatchdogSidecarRestarting` | Sidecar restarting repeatedly (prerequisites unmet / port taken / persistent main-loop errors / own OOM) | Read the container log's CRITICAL lines; meanwhile the target container's ceiling stays at baseline with no OOM rescue |
 | Alert `MemoryWatchdogSpecReadErrors` | API server unreachable; scale decisions blocked | Check the API server / network; OOM rescue cannot run in this state |
 | Alert `MemoryWatchdogSelfMemoryHigh` | The watchdog's own memory is near its 100Mi limit | Check whether someone exec'ed a heavyweight diagnostic process; if a package upgrade raised the baseline, lift the limit to 128Mi |
 | The watchdog container itself OOMKilled (see the `last_terminated_reason` metric) | ~70Mi resident is a constant, so an OOMKill almost always means someone exec'ed a heavyweight diagnostic process, or a dependency upgrade raised the baseline | Check for in-container exec of kubernetes-importing scripts (forbidden); if a package upgrade raised the baseline, lift the limit to 128Mi and re-check the memory curve |
 
 ## Stress drill
 
-The stress tool ships with this repo (`trigger_oom_test.py`); copy it into the `heavy-worker` container and run it (target 24G, grow 100M every 1s, hold 30s, then release):
+The stress tool ships with this repo (`trigger_oom_test.py`); copy it into the `my-worker` container and run it (target 24G, grow 100M every 1s, hold 30s, then release):
 
 ```bash
 kubectl cp trigger_oom_test.py \
-  <namespace>/<pod-name>:/tmp/trigger_oom_test.py -c heavy-worker
-kubectl exec -it <pod-name> -c heavy-worker -n <namespace> -- \
+  <namespace>/<pod-name>:/tmp/trigger_oom_test.py -c my-worker
+kubectl exec -it <pod-name> -c my-worker -n <namespace> -- \
   python3 /tmp/trigger_oom_test.py 24 100 1 30
 ```
 

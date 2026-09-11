@@ -1,0 +1,94 @@
+# Optional hardening: a ValidatingAdmissionPolicy that narrows what the
+# watchdog's ServiceAccount can actually do.
+#
+#   kubectl apply -f admission-policy.yaml
+#
+# Replace throughout:
+#   my-namespace   your namespace
+#   my-worker      the target container name AND the value of the pod's
+#                  `app` label (see deployment-with-sidecar.yaml, marker 1)
+#
+# Requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA).
+#
+# Why this exists: RBAC cannot say "only your own pod, only these fields", so
+# the Role grants pods + pods/resize patch across the namespace. This policy
+# pins every write by that ServiceAccount to exactly what the watchdog does:
+#
+#   1. only pods labelled app=my-worker      -- no touching the neighbours
+#   2. labels immutable                      -- no re-routing Service selectors
+#   3. only the two baseline annotations     -- no other metadata
+#   4. main-resource updates leave spec alone -- no image swaps via pods patch
+#   5. a resize names exactly one target container
+#   6. a resize changes only that container's resources -- no shrinking the
+#      watchdog itself to engineer a targeted OOM
+#   7. cpu immutable                          -- the watchdog owns memory only
+#
+# failurePolicy: Fail is safe here. matchConditions limit the policy to this
+# one ServiceAccount, so if the policy itself breaks, the worst outcome is a
+# denied resize plus the MemoryWatchdogResizeFailed alert -- not a namespace
+# that rejects writes.
+#
+# The objects are cluster-scoped, so their names carry the namespace to avoid
+# collisions between installations; the binding scopes enforcement back to it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: memory-watchdog-guard-my-namespace
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods", "pods/resize"]
+  matchConditions:
+    - name: watchdog-sa-only
+      expression: "request.userInfo.username == 'system:serviceaccount:my-namespace:my-worker-watchdog'"
+  variables:
+    - name: isResize
+      expression: "request.subResource == 'resize'"
+    - name: oldAnn
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    - name: newAnn
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: allowedAnn
+      expression: "['oom-watchdog.io/baseline-memory', 'oom-watchdog.io/baseline-requests']"
+    - name: newC
+      expression: "object.spec.containers.filter(c, c.name == 'my-worker')"
+    - name: oldC
+      expression: "oldObject.spec.containers.filter(c, c.name == 'my-worker')"
+  validations:
+    - expression: "has(object.metadata.labels) && ('app' in object.metadata.labels) && object.metadata.labels['app'] == 'my-worker'"
+      message: "watchdog SA may only modify pods labelled app=my-worker"
+      reason: Forbidden
+    - expression: "(has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})"
+      message: "watchdog SA must not change pod labels"
+      reason: Forbidden
+    - expression: "variables.newAnn.all(k, k in variables.allowedAnn || (k in variables.oldAnn && variables.newAnn[k] == variables.oldAnn[k])) && variables.oldAnn.all(k, k in variables.allowedAnn || k in variables.newAnn)"
+      message: "watchdog SA may only write its two baseline annotations"
+      reason: Forbidden
+    - expression: "variables.isResize || object.spec == oldObject.spec"
+      message: "watchdog SA must not change pod spec outside the resize subresource"
+      reason: Forbidden
+    - expression: "!variables.isResize || (variables.newC.size() == 1 && variables.oldC.size() == 1)"
+      message: "resize target must contain exactly one my-worker container"
+      reason: Forbidden
+    - expression: "!variables.isResize || object.spec.containers.all(c, c.name == 'my-worker' || oldObject.spec.containers.filter(o, o.name == c.name)[0].resources == c.resources)"
+      message: "watchdog SA may only resize the my-worker container"
+      reason: Forbidden
+    - expression: "!variables.isResize || (variables.newC[0].resources.?limits.?cpu.orValue('') == variables.oldC[0].resources.?limits.?cpu.orValue('') && variables.newC[0].resources.?requests.?cpu.orValue('') == variables.oldC[0].resources.?requests.?cpu.orValue(''))"
+      message: "watchdog SA may only change memory, not cpu"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: memory-watchdog-guard-my-namespace
+spec:
+  policyName: memory-watchdog-guard-my-namespace
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: my-namespace

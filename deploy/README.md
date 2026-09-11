@@ -1,30 +1,23 @@
-# 部署参考文件说明
+# 监控栈配套文件
 
-> 只想先看看效果？[`../demo/`](../demo/) 是自包含的一键演示，不需要移植任何模板。
+本目录只放**随监控栈下发**的告警配置——它们不属于工作负载，通常由平台团队统一发布。
 
-本目录展示 watchdog 的完整部署形态。文件取自一个生产级 Helm chart 与监控栈配置，
-已做通用化处理（应用名、镜像仓库、告警通道等均为占位符）：
-
-## helm/
-
-Helm 模板而非可直接 apply 的清单——其中引用了源 chart 的模板助手
-（`app.worker.fullname`、`app.namespace` 等）与 values 键，
-移植到你的 chart 时需替换这些引用。
-
-| 文件 | 作用 |
-|---|---|
-| `deployment_h.yaml` | heavy worker 的 Deployment：watchdog 以原生 sidecar（initContainer + `restartPolicy: Always`）注入，含 resizePolicy、只读 hostPath 挂载、projected SA token |
-| `rbac.yaml` | watchdog 专用 ServiceAccount + Role（pods/pods-resize get+patch、events create）+ RoleBinding |
-| `watchdog-vap.yaml` | ValidatingAdmissionPolicy：七条 CEL 校验把该 SA 的写权限收窄到"仅目标容器的 memory resize + 两个 baseline annotation" |
-| `watchdog-metrics.yaml` | headless Service + ServiceMonitor，供 Prometheus 抓取 `:8090/metrics` |
-| `values-example.yaml` | chart values 中 watchdog 参数块示例 |
+工作负载侧的接入清单（sidecar 注入、RBAC、ValidatingAdmissionPolicy、ServiceMonitor）
+见 [`../examples/`](../examples)：那里是可直接 apply 的完整 YAML。
 
 ## monitoring/
 
-按 kube-prometheus-stack 的 CRD 编写；`${environment}` 是模板变量（源环境经
-Terraform `templatefile` 渲染），直接使用时需自行替换：
-
 | 文件 | 作用 |
 |---|---|
-| `prometheus-rules.yaml` | 6 条 PrometheusRule：resize 失败、宿主机枯竭、spec 读取失败、到达 cap、sidecar 反复重启、自身内存贴线 |
-| `alertmanager-config.yaml` | AlertmanagerConfig：MemoryWatchdog.* 告警路由到 IM 告警通道（示例为 Opsgenie 风格 webhook） |
+| `prometheus-rules.yaml` | PrometheusRule：7 条告警（resize 失败、宿主机枯竭、宿主机视野丢失、spec 读取失败、到达 cap、sidecar 反复重启、自身内存贴线），每条带 runbook_url |
+| `alertmanager-config.yaml` | AlertmanagerConfig：`MemoryWatchdog.*` 路由到 IM 告警通道（示例为 Opsgenie 风格网关），severity 映射到优先级，critical 每小时重复 |
+
+两份都是可直接 apply 的对象，按需替换命名空间过滤与接收方配置：
+
+```bash
+kubectl apply -f monitoring/prometheus-rules.yaml
+kubectl apply -f monitoring/alertmanager-config.yaml -n <monitoring-ns>
+```
+
+未部署这些规则时，watchdog 仍然照常工作并暴露指标与 K8s 事件，但**没有主动告警**——
+启用 watchdog 前应先确认规则已下发（见主 README 的前提条件表）。

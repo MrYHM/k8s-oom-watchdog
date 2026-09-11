@@ -1,0 +1,52 @@
+# Optional: let a prometheus-operator stack scrape the watchdog's metrics.
+#
+#   kubectl apply -f servicemonitor.yaml
+#
+# Replace throughout:
+#   my-namespace   your namespace
+#   my-worker      your workload (must match the pod's `app` label)
+#
+# Requires the prometheus-operator CRDs. Without them, skip this file --
+# the watchdog still serves :8090/metrics for any scraper that can reach the
+# pod, and still emits K8s Events either way.
+#
+# Note your Prometheus must be allowed to pick up ServiceMonitors from this
+# namespace (an empty namespaceSelector, or
+# serviceMonitorSelectorNilUsesHelmValues=false in the kube-prometheus chart).
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-worker-watchdog-metrics
+  namespace: my-namespace
+  labels:
+    app: my-worker-watchdog-metrics
+spec:
+  # Headless: this exists to give the ServiceMonitor something to select,
+  # not to load-balance.
+  clusterIP: None
+  selector:
+    app: my-worker
+  ports:
+    - name: metrics
+      port: 8090
+      # Numeric on purpose: the watchdog is a native sidecar (an
+      # initContainer), and numeric targetPorts avoid depending on named-port
+      # resolution across sidecar containers.
+      targetPort: 8090
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-worker-watchdog
+  namespace: my-namespace
+  labels:
+    app: my-worker-watchdog
+spec:
+  endpoints:
+    - interval: 1m
+      path: /metrics
+      port: metrics
+      scheme: http
+  selector:
+    matchLabels:
+      app: my-worker-watchdog-metrics

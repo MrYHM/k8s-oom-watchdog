@@ -1,0 +1,151 @@
+# Injecting the watchdog into a Job.
+#
+# Batch work is where memory spikes hurt most: an OOM kill an hour into a
+# run throws away the whole hour. Native sidecars make this work properly --
+# before them, a sidecar that never exits would keep the Job from ever
+# completing.
+#
+#   kubectl apply -f rbac.yaml     # once per namespace
+#   kubectl apply -f job-with-sidecar.yaml
+#
+# Replace throughout:
+#   my-namespace   your namespace
+#   my-job         your job and its main container
+#
+# Only the parts that differ from deployment-with-sidecar.yaml are commented
+# here; read that file first for what each piece of the sidecar does.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-job
+  namespace: my-namespace
+spec:
+  backoffLimit: 0        # a rescued job should not need retries
+  template:
+    metadata:
+      labels:
+        app: my-job
+    spec:
+      # Jobs must not restart on their own if the point is to avoid losing
+      # work; let the watchdog prevent the kill instead.
+      restartPolicy: Never
+      serviceAccountName: my-job-watchdog
+      automountServiceAccountToken: false
+
+      initContainers:
+        # A native sidecar terminates after the main container exits, so the
+        # Job reaches Completed normally. restartPolicy: Always is what makes
+        # it a sidecar rather than a blocking init step -- without it the Job
+        # would wait for this container to finish before starting the work.
+        - name: watchdog
+          image: ghcr.io/mryhm/k8s-oom-watchdog:latest   # pin a version in production
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: WATCHDOG_TARGET_CONTAINER
+              value: "my-job"
+            # Batch jobs often climb fast. A lower threshold triggers earlier,
+            # trading some headroom for reaction time.
+            - name: WATCHDOG_THRESHOLD
+              value: "0.75"
+            - name: WATCHDOG_INTERVAL
+              value: "0.1"
+            - name: WATCHDOG_STEP
+              value: "2Gi"
+            - name: WATCHDOG_MAX_FACTOR
+              value: "3.0"
+            - name: WATCHDOG_HOST_CEILING
+              value: "0.90"
+            - name: WATCHDOG_ALLOW_BLIND_SCALEUP
+              value: "false"
+            - name: WATCHDOG_METRICS_PORT
+              value: "8090"
+          ports:
+            - name: metrics
+              containerPort: 8090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          volumeMounts:
+            - mountPath: /host/sys/fs/cgroup
+              name: host-cgroup
+              readOnly: true
+            - mountPath: /host/proc/meminfo
+              name: host-proc-meminfo
+              readOnly: true
+            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              name: watchdog-sa-token
+              readOnly: true
+
+      containers:
+        - name: my-job
+          image: my-registry/my-job:latest
+          resizePolicy:
+            - resourceName: memory
+              restartPolicy: NotRequired
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi     # baseline; may borrow up to 12Gi (factor 3.0)
+
+      volumes:
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: host-proc-meminfo
+          hostPath:
+            path: /proc/meminfo
+            type: File
+        - name: watchdog-sa-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace

@@ -1,0 +1,53 @@
+# ServiceAccount, Role and RoleBinding for the watchdog sidecar.
+#
+# Apply this before the workload:
+#   kubectl apply -f rbac.yaml
+#
+# Replace throughout:
+#   my-namespace   your namespace
+#   my-worker      your workload (only used to name these objects)
+#
+# Scope note: RBAC cannot express "may only patch its own pod", so this Role
+# allows resize-patching any pod in the namespace. Two things narrow that:
+#   * the token is mounted only into the watchdog container, via a projected
+#     volume with automountServiceAccountToken: false on the pod
+#     (see deployment-with-sidecar.yaml)
+#   * admission-policy.yaml pins every write by this ServiceAccount to the
+#     target container's memory and two baseline annotations
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-worker-watchdog
+  namespace: my-namespace
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: my-worker-watchdog
+  namespace: my-namespace
+rules:
+  # pods: read the spec and persist the two baseline annotations.
+  # pods/resize: the in-place vertical scaling subresource (K8s >= 1.33).
+  - apiGroups: [""]
+    resources: ["pods", "pods/resize"]
+    verbs: ["get", "patch"]
+  # Scale actions are recorded as pod events, visible in `kubectl describe
+  # pod`. The client writes through events.k8s.io/v1; granting only the core
+  # group leaves every event rejected with 403.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: my-worker-watchdog
+  namespace: my-namespace
+subjects:
+  - kind: ServiceAccount
+    name: my-worker-watchdog
+    namespace: my-namespace
+roleRef:
+  kind: Role
+  name: my-worker-watchdog
+  apiGroup: rbac.authorization.k8s.io

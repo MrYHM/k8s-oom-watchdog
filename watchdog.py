@@ -169,7 +169,7 @@ def resolve_max_limit(cfg: Config, baseline: int) -> int:
     """Resolve the scale-up cap once the baseline is known.
 
     The cap is always ``WATCHDOG_MAX_FACTOR`` x the pod's own baseline, so
-    one chart-wide parameter adapts to every tenant's limits tier; there is
+    one parameter adapts to workloads of every size; there is
     deliberately no absolute cap (runtime borrowing is already bounded by
     the host ceiling and kubelet allocatable admission). A factor below 1
     would place the cap under the starting limit (the watchdog could then

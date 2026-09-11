@@ -9,7 +9,7 @@
 
 **通用**的容器内存看门狗 Sidecar，适用于任何长周期、内存尖刺型的工作负载（批处理、数据导入、报表聚合、Celery/RQ worker、ETL 任务等）：高频采样目标容器的 cgroup v2 **工作集内存**，在内核 OOM-kill 之前，通过 Kubernetes **原地垂直扩缩容（In-Place Pod Resize，`/resize` 子资源）** 抬高内存上限，任务结束后自动缩回，全程不重启容器、不打断长周期任务。
 
-监督哪个容器由 `WATCHDOG_TARGET_CONTAINER` 环境变量指定（chart 参数 `targetContainer`），与业务技术栈完全解耦——本文与示例模板以 `heavy-worker`（一个 Celery heavy worker，本项目的起源场景）作为目标容器示例。
+监督哪个容器由 `WATCHDOG_TARGET_CONTAINER` 环境变量指定，与业务技术栈完全解耦。文档与 [`examples/`](examples/) 统一用 `my-worker` 作为目标容器占位符；本项目的设计压力来自一个 Celery heavy worker，这也是示例多以长周期批处理为背景的原因。
 
 ## 架构
 
@@ -17,7 +17,7 @@
 flowchart LR
   subgraph pod["Pod"]
     W["watchdog<br/>（原生 sidecar）"]
-    T["目标容器<br/>heavy-worker"]
+    T["目标容器<br/>my-worker"]
   end
   subgraph node["节点"]
     CG["cgroup v2<br/>memory.current / memory.stat"]
@@ -92,7 +92,20 @@ docker build -t <your-registry>/memory-watchdog:<tag> .
 
 镜像内通过 pip 安装了固定版本的 `kubernetes` 客户端（resize 子资源方法需要 ≥33 版本，旧版本走 raw API 兜底路径）。
 
-**2. 移植部署模板**：`deploy/helm/` 提供 watchdog 注入所需的全部模板（Deployment sidecar 片段、RBAC、ValidatingAdmissionPolicy、ServiceMonitor）与 values 示例——它们引用了源 chart 的模板助手，移植到你的 chart 时按 [deploy/README.md](deploy/README.md) 的说明替换；告警规则（`deploy/monitoring/`）随监控栈下发。
+**2. 复制一份示例**：[`examples/`](examples/) 是可直接 apply 的完整清单——
+sidecar 注入 [Deployment](examples/deployment-with-sidecar.yaml) 或
+[Job](examples/job-with-sidecar.yaml)，外加 [RBAC](examples/rbac.yaml)、可选的
+[准入策略](examples/admission-policy.yaml)与
+[ServiceMonitor](examples/servicemonitor.yaml)。每处都有行内注释，占位符只有
+命名空间和容器名两个：
+
+```bash
+sed -e 's/my-namespace/prod/g' -e 's/my-worker/report-builder/g' \
+  examples/rbac.yaml examples/deployment-with-sidecar.yaml | kubectl apply -f -
+```
+
+刻意不提供 Helm chart——sidecar 没有可独立安装的东西，它必须活在你的工作负载里。
+告警规则随监控栈单独下发（`deploy/monitoring/`）。
 
 **3. 启用**：确认下方前提条件全部满足后，设置 `watchdog.enabled: true` 发布。验证方式：
 
@@ -143,7 +156,7 @@ worker:
     tag: "v1.8"
 ```
 
-告警不在 chart 内配置——由监控栈统一下发（见"前提条件"表）。扩容上限只有 `maxMemoryFactor × baseline` 一种模式，刻意不提供绝对值上限（设计取舍见 [docs/design.zh-CN.md](docs/design.zh-CN.md#扩容上限的设计取舍)）。
+告警不在工作负载清单里配置——由监控栈统一下发（见"前提条件"表）。扩容上限只有 `maxMemoryFactor × baseline` 一种模式，刻意不提供绝对值上限（设计取舍见 [docs/design.zh-CN.md](docs/design.zh-CN.md#扩容上限的设计取舍)）。
 
 ## 已知限制（摘要）
 
@@ -167,19 +180,19 @@ worker:
 | 告警 `MemoryWatchdogHostStatsUnreadable` | `/host/proc/meminfo` 挂载异常，宿主机安全校验无法执行 | 检查 hostPath 挂载与节点状态；此状态下不会执行任何扩容，容器无 OOM 抢救 |
 | 告警 `MemoryWatchdogHostMemoryExhausted` | 节点整体拥塞，无安全空间 | 扩容节点；这是设计内的保护行为 |
 | 告警 `MemoryWatchdogScaleUpBlockedAtCap` | 内存压力持续但已达 cap（factor × baseline） | 若为常态，上调该租户 baseline 或 maxMemoryFactor |
-| 告警 `MemoryWatchdogSidecarRestarting` | sidecar 反复重启（前提不满足 / 端口占用 / 主循环持续异常 / 自身 OOM） | 看容器日志 CRITICAL 行；期间 heavy worker 上限停留在 baseline，无 OOM 抢救 |
+| 告警 `MemoryWatchdogSidecarRestarting` | sidecar 反复重启（前提不满足 / 端口占用 / 主循环持续异常 / 自身 OOM） | 看容器日志 CRITICAL 行；期间 目标容器上限停留在 baseline，无 OOM 抢救 |
 | 告警 `MemoryWatchdogSpecReadErrors` | API Server 不可达，扩容决策被阻塞 | 检查 API Server / 网络；此状态下 OOM 抢救无法执行 |
 | 告警 `MemoryWatchdogSelfMemoryHigh` | watchdog 自身内存贴近 100Mi limit | 排查是否有人 exec 了重型诊断进程；包升级抬高基线则提 limit 至 128Mi |
 | watchdog 容器自身 OOMKilled（`last_terminated_reason` 指标可查） | 常驻 ~70Mi 是常数，OOMKilled 几乎必是有人 exec 了重型诊断进程，或依赖包升级抬高了基线 | 排查是否有人在容器内 exec 过 import kubernetes 的脚本（禁止）；若是包升级导致基线抬升，将 limit 提至 128Mi 并复核内存曲线 |
 
 ## 压测演练
 
-压测脚本随本目录提供（`trigger_oom_test.py`），先拷进 `heavy-worker` 容器再运行（目标 24G、每 1s 增长 100M、保持 30s 后释放）：
+压测脚本随本目录提供（`trigger_oom_test.py`），先拷进 `my-worker` 容器再运行（目标 24G、每 1s 增长 100M、保持 30s 后释放）：
 
 ```bash
 kubectl cp trigger_oom_test.py \
-  <namespace>/<pod-name>:/tmp/trigger_oom_test.py -c heavy-worker
-kubectl exec -it <pod-name> -c heavy-worker -n <namespace> -- \
+  <namespace>/<pod-name>:/tmp/trigger_oom_test.py -c my-worker
+kubectl exec -it <pod-name> -c my-worker -n <namespace> -- \
   python3 /tmp/trigger_oom_test.py 24 100 1 30
 ```
 
