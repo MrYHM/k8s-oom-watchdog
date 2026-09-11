@@ -38,9 +38,7 @@ flowchart LR
 
 ## See it work
 
-<!-- Record the GIF with demo/demo.tape (see demo/README.md), then uncomment:
 ![In-place OOM rescue](demo/demo.gif)
--->
 
 [`demo/`](demo/) ships a self-contained demo — its own namespace, RBAC and a
 256Mi target container — that drives memory past the watermark and shows the

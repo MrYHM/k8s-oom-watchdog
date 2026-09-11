@@ -109,11 +109,16 @@ missing host stats).
 
 ## 5. Record
 
-**vhs (recommended)**
+> **Reset before every take.** A previous run leaves the limit at the 1Gi cap
+> and scale-down needs 180s of idle, so a second recording would show no
+> scale-up at all. Recreate the pod first:
+> `kubectl -n watchdog-demo delete pod -l app=bursty-worker --wait=true && ./setup.sh`
+
+**vhs (recommended, when it works)**
 
 ```bash
 cd demo
-vhs demo.tape       # -> demo/demo.gif
+vhs demo.tape       # -> demo.gif
 ```
 
 The tape is already set to 1300x720, font size 16, `PlaybackSpeed 1.5`,
@@ -136,6 +141,25 @@ agg --speed 1.5 --font-size 16 --theme asciinema demo.cast demo.gif
 
 `demo/*.cast` is gitignored; only the rendered GIF gets committed.
 
+**render_gif.py (fallback, no browser or ffmpeg)**
+
+vhs drives a headless Chromium that go-rod downloads on first use. Where that
+download cannot reach its host, **vhs exits 0 and writes nothing** — no error,
+no partial file, and ffmpeg is never even invoked (`~/.cache/rod/browser/`
+staying empty is the tell). Capture the run as text and render it instead:
+
+```bash
+pip install pillow
+./demo.sh | while IFS= read -r l; do \
+    printf '%s\t%s\n' "$(python3 -c 'import time;print(time.time())')" "$l"; \
+  done > frames.tsv
+python3 render_gif.py frames.tsv demo.gif 2.0
+```
+
+Frames follow the real timing of the run, so this is a replay of the actual
+output rather than a re-enactment — the same principle `agg` uses. It also
+produces a far smaller file (~150KB against several MB for a screen capture).
+
 ## 6. Quality gate
 
 - [ ] **Size under 5MB** — `ls -lh demo.gif`. If over: `agg --speed 2`, a
@@ -157,15 +181,10 @@ agg --speed 1.5 --font-size 16 --theme asciinema demo.cast demo.gif
 
 ## 7. Ship it
 
-- [ ] Put the GIF at `demo/demo.gif`.
-- [ ] Uncomment the image line near the top of **both** READMEs (they each
-      carry it as an HTML comment under `## See it work` / `## 效果演示`):
-      ```markdown
-      ![In-place OOM rescue](demo/demo.gif)
-      ```
-- [ ] Commit both READMEs and the GIF together, then check the rendering on
-      github.com — a GIF that fails to inline usually means it exceeded the
-      size cap.
+- [ ] Put the GIF at `demo/demo.gif`. Both READMEs already embed that path,
+      so replacing the file is all it takes.
+- [ ] Commit it and check the rendering on github.com — a GIF that fails to
+      inline usually means it exceeded the size cap.
 - [ ] Tear the demo down: `kubectl delete -f watchdog-demo.yaml`, and delete
       the `ghcr` pull secret if you created it in a shared cluster.
 

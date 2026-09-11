@@ -9,9 +9,15 @@ Deliberately small so the whole rescue is visible in seconds:
 | | |
 |---|---|
 | baseline (target container limit) | 256Mi |
-| scale-up step | 128Mi |
+| scale-up step | 192Mi |
 | cap (`maxMemoryFactor` 4 x baseline) | 1Gi |
-| stress profile | grow to ~700Mi at ~80MiB/s, hold 20s, release |
+| stress profile | grow to ~660Mi at ~46MiB/s, hold 6s, release |
+
+The stress rate is deliberately well below what the rescue path can absorb.
+At ~80MiB/s a 192Mi step buys under 2.5s, which is inside the detect + PATCH +
+kubelet-apply latency, and the container starts losing the race — a real
+demonstration of the [rescue window's upper bound](../docs/design.md#known-limitations-with-reasoning),
+but not what you want in a demo.
 
 ## Prerequisites
 
@@ -56,14 +62,20 @@ the working set is the same number its decisions use (page cache already
 subtracted):
 
 ```
-TIME       WORKING SET        LIMIT   USED%  LAST EVENT
-17:04:12         118Mi        256Mi     46%  -
-17:04:16         207Mi        256Mi     81%  ScaleUpTriggered
-17:04:18         223Mi        384Mi     58%  ResizeApplied
-17:04:24         341Mi        512Mi     67%  ResizeApplied
-...
-restarts: 0
+TIME      WORKING SET   REQUESTS        LIMIT  USED%  RESTARTS  LAST EVENT
+11:34:15        166Mi      256Mi     256Mi      65%         0  Started
+11:34:17        246Mi      448Mi     448Mi <<   55%         0  ResizeCompleted
+11:34:20        406Mi      640Mi     640Mi <<   64%         0  ResizeCompleted
+11:34:22        486Mi      832Mi     832Mi <<   76%         0  ResizeStarted
+11:34:26        647Mi        1Gi       1Gi <<   78%         0  ResizeStarted
 ```
+
+`REQUESTS` and `LIMIT` move together on purpose: borrowed memory has to be
+visible to scheduler accounting, which is what keeps the node and its
+neighbours safe. `RESTARTS` stays at 0 throughout — the point of resizing in
+place — and the run ends by printing the `kubectl` command that reads that
+counter straight from the pod status, so the number is reproducible rather
+than something the demo asserts.
 
 Tear down with `kubectl delete -f watchdog-demo.yaml`.
 
@@ -88,14 +100,12 @@ asciinema rec demo.cast -c ./demo.sh
 agg --speed 1.5 --font-size 16 demo.cast demo.gif
 ```
 
-Then commit the GIF and reference it from the top of the main README:
+Both READMEs already embed `demo/demo.gif`, so re-recording is just a matter
+of replacing the file and committing it.
 
-```markdown
-![In-place OOM rescue](demo/demo.gif)
-```
-
-Keep it under ~5MB so GitHub renders it inline; `agg --speed 2` or a shorter
-`DURATION=30 ./demo.sh` both help.
+Keep it under ~5MB so GitHub renders it inline; a higher `SPEED` argument to
+`render_gif.py`, `agg --speed 2`, or a shorter `DURATION=20 ./demo.sh` all
+help.
 
 ## What to point out when sharing it
 

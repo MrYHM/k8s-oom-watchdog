@@ -38,9 +38,7 @@ flowchart LR
 
 ## 效果演示
 
-<!-- 用 demo/demo.tape 录制 GIF（见 demo/README.md），然后取消注释：
 ![原地 OOM 抢救](demo/demo.gif)
--->
 
 [`demo/`](demo/) 提供一个自包含的演示（独立命名空间、RBAC、256Mi 目标容器）：
 把内存推过水位线，看着 limit **原地**被抬高，结束时 `restarts: 0`。在任何
