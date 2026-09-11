@@ -1,23 +1,44 @@
-# 监控栈配套文件
+# Monitoring stack files
 
-本目录只放**随监控栈下发**的告警配置——它们不属于工作负载，通常由平台团队统一发布。
+Alerting configuration only. These objects ship with your **monitoring stack**,
+not with the workload — typically rolled out by whoever operates Prometheus,
+separately from whoever deploys the watchdog.
 
-工作负载侧的接入清单（sidecar 注入、RBAC、ValidatingAdmissionPolicy、ServiceMonitor）
-见 [`../examples/`](../examples)：那里是可直接 apply 的完整 YAML。
+For the workload side — sidecar injection, RBAC, ValidatingAdmissionPolicy,
+ServiceMonitor — see [`../examples/`](../examples): complete manifests that
+apply as-is.
 
 ## monitoring/
 
-| 文件 | 作用 |
+| File | What it is |
 |---|---|
-| `prometheus-rules.yaml` | PrometheusRule：7 条告警（resize 失败、宿主机枯竭、宿主机视野丢失、spec 读取失败、到达 cap、sidecar 反复重启、自身内存贴线），每条带 runbook_url |
-| `alertmanager-config.yaml` | AlertmanagerConfig：`MemoryWatchdog.*` 的路由与聚合——按 alertname+namespace 分组、critical 每小时重复（其余 6h）、开启恢复通知。接收方是一个 webhook 占位符，需替换为你自己的告警去向 |
+| `prometheus-rules.yaml` | PrometheusRule with 7 alerts: resize failure, host memory exhausted, host stats unreadable, pod spec unreadable, scale-up cap reached, sidecar restarting, watchdog's own memory high. Each carries a `runbook_url`. |
+| `alertmanager-config.yaml` | AlertmanagerConfig: routing and grouping for `MemoryWatchdog.*` — grouped per alert per namespace, criticals repeat hourly (others every 6h), resolved notifications on. **The receiver is a webhook placeholder you replace with your own destination.** |
 
-两份都是可直接 apply 的对象，按需替换命名空间过滤与接收方配置：
+Both apply directly:
 
 ```bash
 kubectl apply -f monitoring/prometheus-rules.yaml
-kubectl apply -f monitoring/alertmanager-config.yaml -n <monitoring-ns>
+kubectl apply -f monitoring/alertmanager-config.yaml -n <monitoring-namespace>
 ```
 
-未部署这些规则时，watchdog 仍然照常工作并暴露指标与 K8s 事件，但**没有主动告警**——
-启用 watchdog 前应先确认规则已下发（见主 README 的前提条件表）。
+Two things to adjust when adopting them:
+
+- **The receiver** in `alertmanager-config.yaml`. It is deliberately a
+  credential-free webhook; swap in `opsgenieConfigs`, `pagerdutyConfigs`,
+  `slackConfigs` or whatever your stack uses. The file's header comment notes
+  the two details worth carrying over.
+- **`runbook_url`** in `prometheus-rules.yaml`, if you keep your own fork of
+  the docs.
+
+The rules are unscoped by namespace on purpose: the watchdog metrics only exist
+where the sidecar runs, so installing cluster-wide is safe. Add a `namespace=~"..."`
+matcher to every `expr` if you want them limited.
+
+## Without these rules
+
+The watchdog still works and still exposes metrics and K8s Events — but nothing
+alerts. That matters more than it sounds: an `Infeasible` resize never creates a
+Pending pod, so **no other part of Kubernetes surfaces it**. Confirm the rules
+are deployed before enabling the watchdog (see the Prerequisites table in the
+[main README](../README.md)).

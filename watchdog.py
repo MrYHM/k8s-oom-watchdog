@@ -836,7 +836,6 @@ class Watchdog:
                     "(requires Kubernetes >= 1.33 / EKS >= 1.34). Disable "
                     "worker.watchdog or upgrade the cluster."
                 )
-            action = "缩容" if is_down else "扩容"
             logger.error("Resize PATCH rejected (status %s): %s", e.status, e.body)
             self.api.emit_event("ResizeFailed",
                                 f"Resize PATCH to {target_str} rejected by API (status {e.status})",
@@ -948,7 +947,6 @@ class Watchdog:
         pending = self.pending
         if cgroup_max == pending["target"]:
             is_down = pending["is_down"]
-            action = "自动回缩" if is_down else "原地垂直扩容"
             logger.info("SUCCESS: kubelet applied the in-place resize; limit is now %s.",
                         bytes_to_k8s_str(cgroup_max))
             self.api.emit_event(
@@ -992,14 +990,16 @@ class Watchdog:
                 logger.warning("Could not check resize conditions: %s", e)
                 reason, message = None, ""
             if reason == "Infeasible":
-                self.abort_pending(f"kubelet 判定 Infeasible: {message}", cgroup_max)
+                self.abort_pending(f"kubelet marked the resize Infeasible: {message}",
+                                   cgroup_max)
                 return
             if reason == "Deferred":
                 logger.info("Resize deferred by kubelet (%s); waiting...", message)
             if self.pending and now - pending["started"] > self.cfg.pending_timeout:
                 self.abort_pending(
-                    f"等待 kubelet 超过 {int(self.cfg.pending_timeout)}s 未生效"
-                    + (f"（最后状态: {reason}）" if reason else ""),
+                    f"kubelet did not apply the resize within "
+                    f"{int(self.cfg.pending_timeout)}s"
+                    + (f" (last condition: {reason})" if reason else ""),
                     cgroup_max,
                 )
 

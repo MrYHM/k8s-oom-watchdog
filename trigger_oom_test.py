@@ -8,7 +8,7 @@ until the target size, holds it, then releases -- driving the working set
 through the watchdog's 80% watermark so the in-place resize path can be
 observed end to end.
 
-Usage (inside the target container, see README.md "压测演练"):
+Usage (inside the target container, see the README's "Stress drill"):
 
     # Some app images manage Python with uv; the interpreter is not on the
     # exec PATH, so use the full venv path:
