@@ -225,6 +225,14 @@ The tests import the production module directly (no cluster, no kubernetes packa
 python3 test_watchdog.py
 ```
 
+## Contributing
+
+Bug reports and fixes are welcome — [CONTRIBUTING.md](CONTRIBUTING.md) covers
+how to run the tests (no cluster or dependencies needed) and what kinds of
+change are likely to land. For anything security-relevant, follow
+[SECURITY.md](SECURITY.md) rather than opening an issue: this sidecar holds a
+token that can patch pods in its namespace.
+
 ## License
 
 [Apache License 2.0](LICENSE)

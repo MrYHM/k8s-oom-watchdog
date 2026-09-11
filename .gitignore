@@ -3,3 +3,9 @@ __pycache__/
 
 # asciinema intermediates; the rendered demo GIF is committed
 demo/*.cast
+
+# Build artefacts from `pip install -e .`
+*.egg-info/
+build/
+dist/
+.venv/

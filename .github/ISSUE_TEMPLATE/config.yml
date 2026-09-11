@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/MrYHM/k8s-oom-watchdog/security/advisories/new
+    about: Report privately instead. This sidecar can patch pods in its namespace.
+  - name: Question about whether this fits your workload
+    url: https://github.com/MrYHM/k8s-oom-watchdog/blob/master/README.md#why-not-vpa
+    about: Start with "Why not VPA?" and the known limitations -- the rescue window has a physical upper bound.

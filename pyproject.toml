@@ -1,0 +1,51 @@
+# Dependency metadata only -- this is not a distributable package. The
+# watchdog ships as a container image (see Dockerfile); this file exists so
+# contributors know what to install and what the version floor is.
+#
+#   pip install -e .            # runtime dependency, to run watchdog.py locally
+#   pip install -e '.[gif]'     # plus Pillow, for demo/render_gif.py
+#
+# uv works the same way against this file (`uv sync --extra gif`); no lock
+# file is committed on purpose, so adopters resolve against their own
+# constraints rather than inheriting ours.
+#
+# Note the unit tests need NOTHING installed: they import the production
+# module and the standard library only, so `python3 test_watchdog.py` runs on
+# a bare interpreter. That is deliberate -- see CONTRIBUTING.md.
+[project]
+name = "k8s-oom-watchdog"
+version = "0.1.0"
+description = "Workload-agnostic Kubernetes OOM watchdog sidecar using in-place pod resize"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{ name = "HY" }]
+keywords = ["kubernetes", "oom", "sidecar", "in-place-pod-resize", "memory", "sre"]
+# No License classifier here: PEP 639 supersedes it with the `license`
+# expression above, and current setuptools rejects having both.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+
+# Pinned, not ranged: the resize-subresource methods the watchdog calls are
+# generated from the Kubernetes >= 1.33 OpenAPI spec, and older clients fall
+# back to a raw-API path. Keep this in step with the Dockerfile.
+dependencies = ["kubernetes==33.1.0"]
+
+[project.optional-dependencies]
+# Only demo/render_gif.py needs this, and only when producing the README GIF.
+gif = ["pillow>=10"]
+
+# Only watchdog.py is importable as a module. Without this, setuptools tries
+# to auto-discover and fails on the three top-level .py files (the tests and
+# the stress tool are scripts, not part of any install).
+[tool.setuptools]
+py-modules = ["watchdog"]
+
+[project.urls]
+Homepage = "https://github.com/MrYHM/k8s-oom-watchdog"
+Documentation = "https://github.com/MrYHM/k8s-oom-watchdog/blob/master/docs/design.md"
+Issues = "https://github.com/MrYHM/k8s-oom-watchdog/issues"

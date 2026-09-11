@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        [CONTRIBUTING.md](https://github.com/MrYHM/k8s-oom-watchdog/blob/master/CONTRIBUTING.md#what-makes-a-good-change-here)
+        lists what is likely to be declined and why — a Helm chart, a webhook
+        injector, CPU scaling, new runtime dependencies. If your idea is one of
+        those, read the reasoning first; if you think it does not apply to your
+        case, say why here.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today? Describe the workload and what goes wrong, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Tuning threshold/step/factor, VPA, a higher baseline — and why none of it fit.
+    validations:
+      required: false

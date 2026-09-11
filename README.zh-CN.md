@@ -216,6 +216,13 @@ curl <pod-ip>:8090/metrics                                                    # 
 python3 test_watchdog.py
 ```
 
+## 参与贡献
+
+欢迎提 bug 和修复——[CONTRIBUTING.md](CONTRIBUTING.md) 说明了如何跑测试（不需要
+集群也不需要装依赖）以及什么样的改动容易被接受。涉及安全的问题请按
+[SECURITY.md](SECURITY.md) 私下上报，不要开 issue：这个 sidecar 持有可以 patch
+命名空间内 pod 的 token。
+
 ## License
 
 [Apache License 2.0](LICENSE)

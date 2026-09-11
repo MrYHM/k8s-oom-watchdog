@@ -18,7 +18,7 @@ Capture, then render:
       done > frames.tsv
     python3 render_gif.py frames.tsv demo.gif 2.0
 
-Requires: pip install pillow
+Requires: pip install -e '.[gif]'   (or just: pip install pillow)
 """
 import os
 import sys

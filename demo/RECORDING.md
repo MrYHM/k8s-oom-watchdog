@@ -149,7 +149,7 @@ no partial file, and ffmpeg is never even invoked (`~/.cache/rod/browser/`
 staying empty is the tell). Capture the run as text and render it instead:
 
 ```bash
-pip install pillow
+pip install -e '..[gif]'      # or: pip install pillow
 ./demo.sh | while IFS= read -r l; do \
     printf '%s\t%s\n' "$(python3 -c 'import time;print(time.time())')" "$l"; \
   done > frames.tsv

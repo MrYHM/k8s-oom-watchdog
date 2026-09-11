@@ -1,0 +1,97 @@
+name: Bug report
+description: The watchdog did something wrong, or did nothing when it should have acted
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most reports come down to one of four things, so please check these first —
+        each costs a minute and resolves a large share of issues:
+
+        1. Is the cluster **>= 1.33**? `pods/resize` does not exist before that.
+        2. Does the target container have `resizePolicy` with
+           `restartPolicy: NotRequired` for memory? Without it the kubelet
+           restarts the container on every resize.
+        3. Does the watchdog initContainer have `restartPolicy: Always`?
+           Without it, it is a blocking init step, not a sidecar.
+        4. Does `WATCHDOG_TARGET_CONTAINER` exactly match the container name?
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected the watchdog to do, and what it did instead.
+      placeholder: |
+        Memory went past 80% of the limit but no resize was attempted.
+    validations:
+      required: true
+
+  - type: textarea
+    id: watchdog-logs
+    attributes:
+      label: Watchdog logs
+      description: |
+        `kubectl logs <pod> -c watchdog`. **Usually decisive** — every refusal is
+        logged with its reason (host red line, cap reached, missing host stats,
+        circuit breaker open).
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: pod-state
+    attributes:
+      label: Pod events and resize conditions
+      description: |
+        ```bash
+        kubectl describe pod <pod> | tail -30
+        kubectl get pod <pod> -o jsonpath='{.status.conditions}'
+        ```
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: k8s-version
+    attributes:
+      label: Kubernetes version
+      description: "`kubectl version` — server version, and the distribution (EKS/GKE/AKS/kubeadm/k3s/kind)"
+      placeholder: "v1.33.4, EKS"
+    validations:
+      required: true
+
+  - type: input
+    id: image-tag
+    attributes:
+      label: Watchdog image tag
+      placeholder: "ghcr.io/mryhm/k8s-oom-watchdog:0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: cgroup
+    attributes:
+      label: cgroup version on the node
+      description: "`stat -fc %T /sys/fs/cgroup` on the node — expect `cgroup2fs`. cgroup v1 is not supported."
+      placeholder: "cgroup2fs"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Watchdog configuration
+      description: The WATCHDOG_* environment variables, and the target container's requests/limits.
+      render: yaml
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the four items above
+          required: true
+        - label: I read the [known limitations](https://github.com/MrYHM/k8s-oom-watchdog/blob/master/docs/design.md#known-limitations-with-reasoning) — in particular that a burst allocating faster than the rescue path can absorb will still OOM, by design
+          required: true
