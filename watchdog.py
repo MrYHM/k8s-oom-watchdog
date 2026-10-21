@@ -26,6 +26,7 @@ Design decisions (see README.md for rationale):
 """
 
 import dataclasses
+import errno
 import glob
 import http.server
 import logging
@@ -49,8 +50,18 @@ except ImportError:  # unit tests exercise the pure functions without the packag
         status = 0
         body = ""
 
+_LOG_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
+               "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}
+
+
+def parse_log_level(value: Optional[str], default: int = logging.INFO) -> int:
+    """Map WATCHDOG_LOG_LEVEL to a logging level; anything unknown falls back
+    to the default instead of crashing the sidecar (and the pod) at import."""
+    return _LOG_LEVELS.get((value or "").strip().upper(), default)
+
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=parse_log_level(os.environ.get("WATCHDOG_LOG_LEVEL")),
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     stream=sys.stdout,
@@ -315,6 +326,14 @@ def decide_scale_down(s: Sample, cfg: Config) -> Decision:
 # ---------------------------------------------------------------------------
 # cgroup v2 access (pure-ish: filesystem only, unit-testable with a tempdir)
 # ---------------------------------------------------------------------------
+def cgroup_gone(err: OSError) -> bool:
+    """True when an OSError from a cgroup file read means the cgroup scope is
+    being (or has been) removed: ENOENT once the directory is gone, ENODEV
+    while the kernel tears it down (open succeeds, read fails)."""
+    # isinstance covers FileNotFoundError raised without an errno (tests, wrappers).
+    return isinstance(err, FileNotFoundError) or err.errno in (errno.ENOENT, errno.ENODEV)
+
+
 def read_cgroup_memory(cgroup_dir: str) -> Tuple[int, Optional[int]]:
     """Return (working_set_bytes, limit_bytes or None when unlimited).
 
@@ -369,20 +388,20 @@ def find_pod_cgroup_dir(pod_uid: Optional[str], host_root: str = HOST_CGROUP_ROO
                 if mount_point != "/sys/fs/cgroup":
                     continue  # e.g. our own /host/sys/fs/cgroup hostPath mount
                 if root_field == "/" or ".." in root_field:
-                    logger.info("Private cgroup namespace detected (mountinfo root %r); "
-                                "using the pod-UID glob fallback.", root_field)
+                    logger.debug("Private cgroup namespace detected (mountinfo root %r); "
+                                 "using the pod-UID glob fallback.", root_field)
                     break
                 parent = os.path.dirname(root_field).lstrip("/")
                 candidate = os.path.join(host_root, parent)
                 if os.path.isdir(candidate):
-                    logger.info("Fast-path matched pod cgroup via mountinfo: %s", candidate)
+                    logger.debug("Fast-path matched pod cgroup via mountinfo: %s", candidate)
                     return candidate
                 break
     except OSError as e:
         logger.debug("Failed parsing mountinfo: %s", e)
 
     if pod_uid:
-        logger.info("Falling back to glob scanning for pod UID under %s ...", host_root)
+        logger.debug("Falling back to glob scanning for pod UID under %s ...", host_root)
         uid_normalized = pod_uid.replace("-", "_")
         for pattern in (f"**/*{uid_normalized}*", f"**/*{pod_uid}*"):
             for match in glob.glob(os.path.join(host_root, pattern), recursive=True):
@@ -655,6 +674,7 @@ _METRIC_META: Dict[str, Tuple[str, str]] = {
     "watchdog_working_set_bytes": ("gauge", "Target container working set (memory.current - inactive_file)"),
     "watchdog_memory_limit_bytes": ("gauge", "Memory limit currently enforced by the kernel"),
     "watchdog_baseline_bytes": ("gauge", "Baseline memory limit the watchdog returns to"),
+    "watchdog_target_present": ("gauge", "1 while the target container's cgroup exists, 0 while it is gone (restarting)"),
 }
 
 
@@ -727,7 +747,7 @@ def start_metrics_server(metrics: Metrics, port: int, heartbeat: Optional[Heartb
     # explanation in the logs. main() turns this into fatal().
     server = http.server.ThreadingHTTPServer(("", port), Handler)
     threading.Thread(target=server.serve_forever, name="metrics", daemon=True).start()
-    logger.info("Metrics endpoint listening on :%d/metrics", port)
+    logger.debug("Metrics endpoint listening on :%d/metrics", port)
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +765,9 @@ class Watchdog:
     SPEC_REFRESH_INTERVAL = 2.0   # rate limit for pod spec reads
     PENDING_CHECK_INTERVAL = 2.0  # rate limit for resize-condition polls
     BLOCKED_PATH_SLEEP = 10.0     # back-off while a scale-up stays blocked
+    TARGET_GONE_POLL = 2.0        # back-off while the target container is gone
+    EPISODE_END_MARGIN = 0.10     # pressure episode ends below (threshold - margin)
+    PRESSURE_EPISODES = ("watermark", "host_full", "no_host_stats", "recheck_cancel")
 
     def __init__(self, cfg: Config, api: PodApi,
                  metrics: Metrics, heartbeat: Heartbeat, target_dir: str,
@@ -808,6 +831,12 @@ class Watchdog:
         # a (re)start and avoids comparing against the monotonic epoch 0.0.
         self.last_scale_up = now_fn()
         self.last_spec_read = 0.0
+        # Set while the target's cgroup scope is missing (container restart /
+        # CrashLoopBackOff); the loop waits instead of erroring.
+        self.target_gone_since: Optional[float] = None
+        # key -> (started_at, repeats); see _log_episode / _end_episode.
+        self._episodes: Dict[str, Tuple[float, int]] = {}
+        self.metrics.set_gauge("watchdog_target_present", 1)
 
     # ------------------------- resize plumbing -------------------------
     def do_patch(self, target_bytes: int, is_down: bool) -> bool:
@@ -891,6 +920,67 @@ class Watchdog:
         self.pending = None
         self.circuit_open_until = self._now() + self.cfg.circuit_cooldown
 
+    # ------------------------- log noise control -------------------------
+    EPISODE_LABELS = {
+        "watermark": "memory watermark critical",
+        "host_full": "host capacity exhausted",
+        "no_host_stats": "host memory stats unavailable",
+        "target_gone": "target container gone",
+        "recheck_cancel": "scale-up cancelled on re-check",
+    }
+
+    def _log_episode(self, key: str, level: int, message: str, *args) -> None:
+        """Log a condition that holds for many consecutive ticks at its real
+        level the first time, and at DEBUG while it persists (set
+        WATCHDOG_LOG_LEVEL=DEBUG for the full per-tick trail). Metrics and
+        K8s events (60s dedup) are unaffected; _end_episode closes it with one
+        INFO summary so the next onset logs at full level again."""
+        started, repeats = self._episodes.get(key, (None, 0))
+        if started is None:
+            logger.log(level, message, *args)
+            self._episodes[key] = (self._now(), 0)
+        else:
+            logger.debug(message, *args)
+            self._episodes[key] = (started, repeats + 1)
+
+    def _episode_end_ratio(self) -> float:
+        """Working-set fraction below which a pressure episode ends: the
+        watermark minus EPISODE_END_MARGIN, never lower than half the
+        watermark so a very low threshold cannot make episodes unending."""
+        return max(self.cfg.threshold - self.EPISODE_END_MARGIN, self.cfg.threshold * 0.5)
+
+    def _end_episode(self, *keys: str, quiet: bool = False) -> None:
+        for key in keys:
+            entry = self._episodes.pop(key, None)
+            if not entry or quiet:
+                continue
+            started, repeats = entry
+            # An episode that never repeated (crossed the watermark and was
+            # rescued in the same tick) is fully described by its first line.
+            if repeats == 0:
+                continue
+            logger.info("Episode over: %s lasted %.0fs (%d repeats logged at DEBUG).",
+                        self.EPISODE_LABELS.get(key, key), self._now() - started, repeats)
+
+    def _wait_for_target(self, now: float) -> None:
+        """The target's cgroup scope is gone and no replacement exists yet.
+        A CrashLoopBackOff keeps it away for minutes; that is the main
+        container's problem, not ours. Say so once, poll quietly, and let
+        _relocate_cgroup rebind when it returns."""
+        if self.target_gone_since is None:
+            self.target_gone_since = now
+            self.pending = None
+            self.low_since = None
+            self.metrics.set_gauge("watchdog_target_present", 0)
+            # No container, no working set: do not leave the last sample
+            # frozen on dashboards while the target is away.
+            self.metrics.set_gauge("watchdog_working_set_bytes", 0)
+            self.metrics.set_gauge("watchdog_memory_limit_bytes", 0)
+        self._log_episode("target_gone", logging.WARNING,
+                          "Target container %s is gone (restarting?); waiting for it to come back.",
+                          TARGET_CONTAINER)
+        self._sleep(self.TARGET_GONE_POLL)
+
     def _relocate_cgroup(self) -> bool:
         """Rebind after the target container restarted (its old cgroup scope,
         named by container ID, disappears and a new one is created)."""
@@ -898,12 +988,24 @@ class Watchdog:
         try:
             container_id = self.api.get_container_id(self.api.get_pod())
         except Exception as e:
-            logger.warning("Could not refresh container ID during cgroup relocation: %s", e)
+            # Repeats every poll while the container is gone: log the first
+            # failure of an episode, the rest at debug.
+            if self.target_gone_since is None:
+                logger.warning("Could not refresh container ID during cgroup relocation: %s", e)
+            else:
+                logger.debug("Could not refresh container ID during cgroup relocation: %s", e)
         new_dir = self._find_container_dir(self.pod_slice, container_id)
         if not new_dir or new_dir == self.target_dir:
             return False
-        logger.warning("Target container cgroup moved (container restarted?): %s -> %s",
-                       self.target_dir, new_dir)
+        if self.target_gone_since is not None:
+            logger.info("Target container %s is back after %.0fs; cgroup relocated to %s",
+                        TARGET_CONTAINER, self._now() - self.target_gone_since, new_dir)
+            self.target_gone_since = None
+            self._end_episode("target_gone", quiet=True)  # the line above is the summary
+            self.metrics.set_gauge("watchdog_target_present", 1)
+        else:
+            logger.warning("Target container cgroup moved (container restarted?): %s -> %s",
+                           self.target_dir, new_dir)
         self.target_dir = new_dir
         self.metrics.inc("watchdog_cgroup_relocated_total")
         self.api.emit_event(
@@ -924,10 +1026,12 @@ class Watchdog:
 
         try:
             working_set, cgroup_max = self._read_cgroup(self.target_dir)
-        except FileNotFoundError:
-            if self._relocate_cgroup():
-                return  # rebound; observe fresh state next tick
-            raise
+        except OSError as e:
+            if not cgroup_gone(e):
+                raise
+            if not self._relocate_cgroup():
+                self._wait_for_target(now)
+            return  # rebound or still gone; observe fresh state next tick
         if cgroup_max is None or cgroup_max <= 0:
             return
         self.metrics.set_gauge("watchdog_working_set_bytes", working_set)
@@ -1010,7 +1114,8 @@ class Watchdog:
             self.metrics.inc("watchdog_blocked_total", {"reason": "circuit_open"})
             return
 
-        logger.warning(
+        self._log_episode(
+            "watermark", logging.WARNING,
             "Memory watermark critical! working_set=%.1fMB limit=%.1fMB usage=%.1f%%",
             working_set / MIB, cgroup_max / MIB, working_set * 100.0 / cgroup_max,
         )
@@ -1052,8 +1157,9 @@ class Watchdog:
         decision = decide_scale_up(sample, self.cfg)
 
         if decision.action == Action.BLOCKED_NO_HOST_STATS:
-            logger.critical("Host memory stats unavailable; scale-up refused. "
-                            "Check the /host/proc/meminfo hostPath mount!")
+            self._log_episode("no_host_stats", logging.CRITICAL,
+                              "Host memory stats unavailable; scale-up refused. "
+                              "Check the /host/proc/meminfo hostPath mount!")
             self.api.emit_event("WatchdogBlind",
                                 "Host memory stats unavailable; scale-up refused and "
                                 "OOM rescue is inoperative", event_type="Warning")
@@ -1069,7 +1175,8 @@ class Watchdog:
             self._sleep(self.BLOCKED_PATH_SLEEP)
             return
         if decision.action == Action.BLOCKED_HOST_FULL:
-            logger.critical("HOST CAPACITY EXHAUSTED: %s", decision.reason)
+            self._log_episode("host_full", logging.CRITICAL,
+                              "HOST CAPACITY EXHAUSTED: %s", decision.reason)
             self.api.emit_event("ScaleUpBlocked",
                                 f"Scale-up refused to protect the node: {decision.reason}",
                                 event_type="Warning")
@@ -1085,15 +1192,23 @@ class Watchdog:
         # pointless Infeasible round-trips.
         self._sleep(self._jitter())
         host_total, host_available = self._host_stats()
-        fresh_ws, fresh_max = self._read_cgroup(self.target_dir)
+        try:
+            fresh_ws, fresh_max = self._read_cgroup(self.target_dir)
+        except OSError as e:
+            if not cgroup_gone(e):
+                raise
+            return  # container went away mid-decision; next tick handles it
         recheck = decide_scale_up(
             Sample(fresh_ws, fresh_max or cgroup_max, self.spec_limit, self.baseline,
                    host_total, host_available),
             self.cfg,
         )
         if recheck.action not in (Action.SCALE_UP, Action.SCALE_UP_ADAPTIVE):
-            logger.warning("Scale-up cancelled on re-check: %s (%s)",
-                           recheck.action, recheck.reason)
+            # Repeats every tick while the working set hovers at the watermark
+            # (sample above, re-check below): episode-logged like the others.
+            self._log_episode("recheck_cancel", logging.WARNING,
+                              "Scale-up cancelled on re-check: %s (%s)",
+                              recheck.action, recheck.reason)
             self.metrics.inc("watchdog_blocked_total", {"reason": "recheck"})
             return
 
@@ -1103,6 +1218,8 @@ class Watchdog:
             # own line: the reason names which constraint bound the step, and
             # the generic rescue log below does not distinguish the two paths.
             logger.warning("Adaptive step-down: %s", recheck.reason)
+        # A rescue ends the blocked/pressure episode: the next onset logs fresh.
+        self._end_episode(*self.PRESSURE_EPISODES)
         logger.info("TRIGGERING OOM RESCUE: in-place resize %s -> %s",
                     bytes_to_k8s_str(self.spec_limit), bytes_to_k8s_str(target))
         old_limit = self.spec_limit
@@ -1121,6 +1238,12 @@ class Watchdog:
 
     # --------------------------- scale-down path ---------------------------
     def _scale_down_path(self, now: float, working_set: int, cgroup_max: int) -> None:
+        # The pressure episode ends only once the working set is clearly
+        # below the watermark (threshold - EPISODE_END_MARGIN): a pod hovering
+        # around 80% must not open and close an episode on every crossing,
+        # which would log more than the per-tick lines this replaces.
+        if working_set < int(cgroup_max * self._episode_end_ratio()):
+            self._end_episode(*self.PRESSURE_EPISODES)
         decision = decide_scale_down(
             Sample(working_set, cgroup_max, self.spec_limit, self.baseline, None, None,
                    requests_inflated=self._requests_inflated()),
@@ -1230,16 +1353,17 @@ def main() -> None:
         fatal(f"Could not bind the metrics/liveness endpoint on port "
               f"{cfg.metrics_port}: {e}")
 
-    logger.info("=" * 70)
-    logger.info("Starting OOM watchdog sidecar (limits-only in-place resize).")
-    logger.info("Target pod: %s | namespace: %s | uid: %s", pod_name, pod_namespace, pod_uid)
+    # Two INFO lines per start (this one, and one once monitoring begins):
+    # every startup line is multiplied by pod churn across the whole log
+    # index, and a sidecar restart must not out-shout the main container.
     logger.info(
-        "Config - threshold: %.0f%%, interval: %.2fs, step: %s, cap: %g x baseline, "
-        "host ceiling: %.0f%%",
+        "Starting OOM watchdog for container %r in %s/%s (uid %s) | "
+        "threshold %.0f%%, interval %.2fs, step %s, cap %gx baseline, "
+        "host ceiling %.0f%%, metrics :%d",
+        TARGET_CONTAINER, pod_namespace, pod_name, pod_uid,
         cfg.threshold * 100, cfg.poll_interval, bytes_to_k8s_str(cfg.step_bytes),
-        cfg.max_factor, cfg.host_ceiling * 100,
+        cfg.max_factor, cfg.host_ceiling * 100, cfg.metrics_port,
     )
-    logger.info("=" * 70)
 
     if not pod_name or not pod_namespace:
         fatal("POD_NAME / POD_NAMESPACE environment variables are required (downward API).")
@@ -1250,7 +1374,7 @@ def main() -> None:
         k8s_config.load_incluster_config()
         api = PodApi(k8s_client.CoreV1Api(), pod_name, pod_namespace,
                      events_v1=k8s_client.EventsV1Api(), pod_uid=pod_uid)
-        logger.info("Loaded in-cluster Kubernetes configuration.")
+        logger.debug("Loaded in-cluster Kubernetes configuration.")
     except Exception as e:
         fatal(f"Failed to load in-cluster Kubernetes configuration: {e}")
         return
@@ -1259,7 +1383,7 @@ def main() -> None:
     if not pod_slice:
         fatal(f"Could not locate the pod cgroup slice under {HOST_CGROUP_ROOT}.")
         return
-    logger.info("Bound to pod cgroup path: %s", pod_slice)
+    logger.debug("Bound to pod cgroup path: %s", pod_slice)
 
     # Container ID from pod status makes cgroup matching exact; the >500Mi
     # size heuristic remains as fallback while the status is not ready yet.
@@ -1283,14 +1407,13 @@ def main() -> None:
         target_dir = find_target_cgroup_dir(pod_slice, container_id)
         if target_dir:
             break
-        if attempt == 1 or attempt % 10 == 0:
+        if attempt == 1 or attempt % 60 == 0:
             logger.info("[%d/300] Waiting for %s container cgroup to initialize...",
                         attempt, TARGET_CONTAINER)
         time.sleep(1)
     if not target_dir:
         fatal(f"Could not locate the {TARGET_CONTAINER} cgroup directory after 300 seconds.")
         return
-    logger.info("Monitoring %s cgroup: %s", TARGET_CONTAINER, target_dir)
 
     # Baseline limit AND baseline requests: persisted in pod annotations so a
     # watchdog restart after a resize does not adopt the inflated limit (or
@@ -1299,16 +1422,18 @@ def main() -> None:
         pod = api.get_pod()
         annotations = pod.metadata.annotations or {}
         baseline_str = annotations.get(BASELINE_ANNOTATION)
+        baseline_source = "annotation"
         if baseline_str:
-            logger.info("Restored baseline from pod annotation: %s", baseline_str)
+            logger.debug("Restored baseline from pod annotation: %s", baseline_str)
         else:
+            baseline_source = "spec"
             baseline_str = api.get_container_limit(pod)
             if not baseline_str:
                 fatal("Could not determine the baseline memory limit from the pod spec.")
                 return
             try:
                 api.annotate(BASELINE_ANNOTATION, baseline_str)
-                logger.info("Persisted baseline %s to pod annotation.", baseline_str)
+                logger.debug("Persisted baseline %s to pod annotation.", baseline_str)
             except Exception as e:
                 logger.warning("Could not persist baseline annotation (continuing): %s", e)
         baseline = parse_memory_to_bytes(baseline_str)
@@ -1319,14 +1444,14 @@ def main() -> None:
         current_req_str = api.get_container_requests(pod)
         baseline_req_str = annotations.get(BASELINE_REQUESTS_ANNOTATION)
         if baseline_req_str:
-            logger.info("Restored baseline requests from pod annotation: %s", baseline_req_str)
+            logger.debug("Restored baseline requests from pod annotation: %s", baseline_req_str)
         else:
             baseline_req_str = api.get_container_requests(pod)
             if baseline_req_str:
                 try:
                     api.annotate(BASELINE_REQUESTS_ANNOTATION, baseline_req_str)
-                    logger.info("Persisted baseline requests %s to pod annotation.",
-                                baseline_req_str)
+                    logger.debug("Persisted baseline requests %s to pod annotation.",
+                                 baseline_req_str)
                 except Exception as e:
                     logger.warning("Could not persist baseline requests annotation "
                                    "(continuing): %s", e)
@@ -1339,8 +1464,11 @@ def main() -> None:
 
     # The cap derives from the baseline, so it is only final here.
     cfg.max_limit_bytes = resolve_max_limit(cfg, baseline)
-    logger.info("Scale-up cap resolved: %s (%g x baseline)",
-                bytes_to_k8s_str(cfg.max_limit_bytes), cfg.max_factor)
+    logger.info(
+        "Monitoring %s cgroup %s | baseline %s (from %s), requests %s | cap %s (%gx)",
+        TARGET_CONTAINER, target_dir, baseline_str, baseline_source,
+        baseline_req_str or "n/a", bytes_to_k8s_str(cfg.max_limit_bytes), cfg.max_factor,
+    )
 
     watchdog_loop = Watchdog(
         cfg, api, metrics, heartbeat,

@@ -89,6 +89,10 @@ spec:
               value: "false"
             - name: WATCHDOG_METRICS_PORT
               value: "8090"
+            # INFO: two startup lines plus one line per state change; DEBUG
+            # restores the per-tick trail of conditions that repeat every cycle.
+            - name: WATCHDOG_LOG_LEVEL
+              value: "INFO"
           ports:
             - name: metrics
               containerPort: 8090

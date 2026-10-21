@@ -128,16 +128,17 @@ curl <pod-ip>:8090/metrics               # Prometheus 指标
 
 每条机制的实现细节与设计论证见 **[docs/design.zh-CN.md](docs/design.zh-CN.md)**。
 
-1. **定位 cgroup**：启动时经 mountinfo 或 POD_UID glob 定位目标容器的 cgroup 目录（兼容私有 cgroup namespace）；主容器重启后自动重新定位，不陷入盲区。
+1. **定位 cgroup**：启动时经 mountinfo 或 POD_UID glob 定位目标容器的 cgroup 目录（兼容私有 cgroup namespace）；主容器重启后自动重新定位，不陷入盲区。主容器 CrashLoop、新 cgroup 迟迟不出现时**静默等待**（WARNING 一条、`watchdog_target_present=0`、每 2s 静默重试），不会每个采样周期报错并自杀重启。
 2. **工作集口径**：`memory.current − inactive_file`，与 kubelet 的 OOM 记账一致，IO 密集任务不会因 page cache 虚高误扩容。
 3. **扩容**：工作集 ≥ 80% limit 时按步长 PATCH `/resize`，**requests 与 limits 同步抬升**——借用的内存全程纳入调度记账，宿主机与邻居 pod 始终安全。
 4. **宿主机红线**：`新 limit + 宿主机其他负载 < 90% × 物理内存` 才放行；空间不足自适应降级步长，彻底没空间则熔断告警。
 5. **失败处理**：Infeasible 或 60s 超时 → 回滚 spec + 高危告警 + 10 分钟熔断，绝不无限等待。
 6. **缩容**：工作集 < 40% 且稳定 180s 才逐级回落，与扩容线形成宽迟滞带；缩容在途遇到新压力立即撤回，外部 resize 一律收编监督而非覆盖。
 7. **Baseline 持久化**：初始 limit/requests 写入 pod annotation，sidecar 重启不丢账。
-8. **失效自省**：读不到宿主机内存时拒绝扩容并持续高危告警，绝不静默跳过。
+8. **失效自省**：读不到宿主机内存时拒绝扩容并持续高危告警，绝不静默跳过。目标容器消失不算异常，走上面的等待态。
 9. **原生 sidecar**：先于主容器启动、晚于其终止，覆盖含超长优雅退出期的完整生命周期；非 root、只读根文件系统、drop 全部 capabilities。
 10. **可观测性**：Prometheus 指标 + K8s Events + 心跳驱动的 `/healthz`；告警由监控栈统一承载（7 条 PrometheusRule），watchdog 只负责秒级闭环处置与打点。
+11. **日志纪律**：启动只打 2 行 INFO；每个采样周期都会重复的状态（水位告急、宿主机枯竭、宿主机信息不可读、复核取消、目标容器消失）首次按原级别记一条，持续期间降为 DEBUG，结束时 INFO 汇总一行。`WATCHDOG_LOG_LEVEL=DEBUG` 恢复逐周期轨迹；指标与 K8s 事件不受影响。
 
 ## 部署参数（`values.yaml`）
 
@@ -152,6 +153,7 @@ worker:
     hostCeiling: 0.90        # 宿主机物理内存红线
     allowBlindScaleup: false # 读不到宿主机内存时是否允许盲扩半步长
     metricsPort: 8090        # /metrics 与 /healthz 端口
+    logLevel: "INFO"         # DEBUG 可看到重复状态的逐周期轨迹
     repository: "registry.example.com/memory-watchdog"
     tag: "v1.8"
 ```
@@ -180,7 +182,8 @@ worker:
 | 告警 `MemoryWatchdogHostStatsUnreadable` | `/host/proc/meminfo` 挂载异常，宿主机安全校验无法执行 | 检查 hostPath 挂载与节点状态；此状态下不会执行任何扩容，容器无 OOM 抢救 |
 | 告警 `MemoryWatchdogHostMemoryExhausted` | 节点整体拥塞，无安全空间 | 扩容节点；这是设计内的保护行为 |
 | 告警 `MemoryWatchdogScaleUpBlockedAtCap` | 内存压力持续但已达 cap（factor × baseline） | 若为常态，上调该租户 baseline 或 maxMemoryFactor |
-| 告警 `MemoryWatchdogSidecarRestarting` | sidecar 反复重启（前提不满足 / 端口占用 / 主循环持续异常 / 自身 OOM） | 看容器日志 CRITICAL 行；期间 目标容器上限停留在 baseline，无 OOM 抢救 |
+| 告警 `MemoryWatchdogSidecarRestarting` | sidecar 反复重启（前提不满足 / 端口占用 / 主循环持续异常 / 自身 OOM） | 看容器日志 CRITICAL 行；期间目标容器上限停留在 baseline，无 OOM 抢救。v0.1.0 中主容器 CrashLoop 也会连带触发此告警（100 次 cgroup 读失败后自杀），现已不会 |
+| 日志 WARNING `Target container ... is gone (restarting?)`（指标 `watchdog_target_present=0`） | 主容器重启中 / CrashLoopBackOff | 这是主容器的故障，看主容器日志与 `kubectl describe pod`；watchdog 静默等待，容器回来后自动恢复 |
 | 告警 `MemoryWatchdogSpecReadErrors` | API Server 不可达，扩容决策被阻塞 | 检查 API Server / 网络；此状态下 OOM 抢救无法执行 |
 | 告警 `MemoryWatchdogSelfMemoryHigh` | watchdog 自身内存贴近 100Mi limit | 排查是否有人 exec 了重型诊断进程；包升级抬高基线则提 limit 至 128Mi |
 | watchdog 容器自身 OOMKilled（`last_terminated_reason` 指标可查） | 常驻 ~70Mi 是常数，OOMKilled 几乎必是有人 exec 了重型诊断进程，或依赖包升级抬高了基线 | 排查是否有人在容器内 exec 过 import kubernetes 的脚本（禁止）；若是包升级导致基线抬升，将 limit 提至 128Mi 并复核内存曲线 |
