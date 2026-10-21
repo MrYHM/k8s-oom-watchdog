@@ -8,6 +8,8 @@ the module guards that import) and exercises the pure decision layer plus the
 cgroup/file parsing helpers against temp directories.
 """
 
+import errno
+import logging
 import os
 import shutil
 import socket
@@ -505,13 +507,172 @@ class TestWatchdogStateMachine(unittest.TestCase):
         clock.advance(0.1)
         wd.tick()  # now reads the new scope without raising
 
-    def test_enoent_without_replacement_raises(self):
+    def test_enoent_without_replacement_waits_quietly(self):
+        # CrashLoopBackOff keeps the target's cgroup away for minutes. That
+        # is the main container's incident: the watchdog must not turn it
+        # into one ERROR line every 2s (and a sidecar restart every 100).
         def read(path):
             raise FileNotFoundError(path)
 
         wd, api, clock = make_watchdog(read)  # find_dir returns None
-        with self.assertRaises(FileNotFoundError):
+        with self.assertLogs("watchdog", level="DEBUG") as logs:
+            for _ in range(100):
+                wd.tick()  # must not raise
+        gone = [r for r in logs.records if "is gone" in r.getMessage()]
+        self.assertEqual([r.levelname for r in gone].count("WARNING"), 1, logs.output[:3])
+        self.assertEqual([r.levelname for r in gone].count("DEBUG"), 99)
+        self.assertEqual(wd.metrics._gauges["watchdog_target_present"], 0)
+        self.assertEqual(wd.metrics._gauges["watchdog_working_set_bytes"], 0)
+        self.assertEqual(wd.metrics._gauges["watchdog_memory_limit_bytes"], 0)
+        # Backs off between polls instead of hammering the API every 100ms.
+        self.assertGreaterEqual(clock.now(), 1000.0 + 100 * wd.TARGET_GONE_POLL)
+
+        # The container comes back: one INFO line, gauge restored, resumes.
+        wd._find_container_dir = lambda pod_slice, cid=None: "/fake/pod/new.scope"
+        wd._read_cgroup = lambda path: (1 * GIB, 4 * GIB) if path == "/fake/pod/new.scope" \
+            else (_ for _ in ()).throw(FileNotFoundError(path))
+        with self.assertLogs("watchdog", level="INFO") as logs:
             wd.tick()
+        self.assertTrue(any("is back after" in line for line in logs.output), logs.output)
+        self.assertEqual(wd.target_dir, "/fake/pod/new.scope")
+        self.assertEqual(wd.metrics._gauges["watchdog_target_present"], 1)
+        self.assertIsNone(wd.target_gone_since)
+        # A later restart logs "is gone" again (throttle was cleared).
+        wd._find_container_dir = lambda pod_slice, cid=None: None
+        wd._read_cgroup = read
+        with self.assertLogs("watchdog", level="WARNING") as logs:
+            wd.tick()
+        self.assertIn("is gone", logs.output[0])
+
+    def test_blocked_host_full_log_is_throttled(self):
+        # Pod pinned at 90% of its limit on a host at the red line: the
+        # blocked decision repeats every BLOCKED_PATH_SLEEP (10s). Events
+        # already dedup at 60s; the log must not emit a CRITICAL pair every
+        # 10s for hours.
+        high = (int(1.8 * GIB), 2 * GIB)
+        state = {"ws": high}
+        wd, api, clock = make_watchdog(lambda path: state["ws"], host=(32 * GIB, 1 * GIB))
+        with self.assertLogs("watchdog", level="DEBUG") as logs:
+            for _ in range(30):      # 30 x 10s = 300s of sustained pressure
+                wd.tick()
+        crit = [r for r in logs.records if "HOST CAPACITY EXHAUSTED" in r.getMessage()]
+        warn = [r for r in logs.records if "Memory watermark critical" in r.getMessage()]
+        self.assertEqual([r.levelname for r in crit], ["CRITICAL"] + ["DEBUG"] * 29)
+        self.assertEqual([r.levelname for r in warn], ["WARNING"] + ["DEBUG"] * 29)
+        # Metrics keep counting every blocked decision.
+        self.assertEqual(wd.metrics._counters['watchdog_blocked_total{reason="host_full"}'], 30)
+        self.assertEqual(api.patches, [])
+        # Pressure clears (scale-down path): one INFO summary per episode.
+        state["ws"] = (int(0.5 * GIB), 2 * GIB)
+        with self.assertLogs("watchdog", level="INFO") as logs:
+            wd.tick()
+        over = [l for l in logs.output if "Episode over" in l]
+        self.assertEqual(len(over), 2, logs.output)
+        self.assertTrue(any("host capacity exhausted" in l and "29 repeats" in l for l in over), over)
+        # Next onset logs at full level again.
+        state["ws"] = high
+        with self.assertLogs("watchdog", level="WARNING") as logs:
+            wd.tick()
+        self.assertTrue(any("HOST CAPACITY EXHAUSTED" in l for l in logs.output), logs.output)
+
+    def test_pressure_episode_end_has_hysteresis(self):
+        # Hovering around the 80% watermark (79% <-> 81%) must not open and
+        # close the episode on every crossing: that would log MORE than the
+        # per-tick lines the episode mechanism replaces.
+        seq = [(int(0.79 * 2 * GIB), 2 * GIB), (int(0.81 * 2 * GIB), 2 * GIB)]
+        state = {"i": 0}
+
+        def read(path):
+            value = seq[state["i"] % 2]
+            state["i"] += 1
+            return value
+
+        wd, api, clock = make_watchdog(read, host=(32 * GIB, 1 * GIB))
+        with self.assertLogs("watchdog", level="INFO") as logs:
+            for _ in range(200):
+                wd.tick()
+        visible = [r for r in logs.records if r.levelno >= logging.INFO]
+        self.assertEqual([r.levelname for r in visible], ["WARNING", "CRITICAL"], logs.output[:5])
+        # Dropping clearly below the watermark (threshold - 10%) ends it.
+        state["i"] = 0
+        seq[:] = [(int(0.69 * 2 * GIB), 2 * GIB)] * 2
+        with self.assertLogs("watchdog", level="INFO") as logs:
+            wd.tick()
+        self.assertEqual(sum("Episode over" in l for l in logs.output), 2, logs.output)
+
+    def test_recheck_cancel_is_episode_logged(self):
+        # Host HAS room, working set hovers at the watermark: the sample reads
+        # 81% (decide SCALE_UP), the pre-PATCH re-check reads 79% (cancel).
+        # Without an episode this was one WARNING per tick, no sleep.
+        seq = [(int(0.81 * 2 * GIB), 2 * GIB), (int(0.79 * 2 * GIB), 2 * GIB)]
+        state = {"i": 0}
+
+        def read(path):
+            value = seq[state["i"] % 2]
+            state["i"] += 1
+            return value
+
+        wd, api, clock = make_watchdog(read, host=(32 * GIB, 20 * GIB))
+        with self.assertLogs("watchdog", level="INFO") as logs:
+            for _ in range(200):
+                wd.tick()
+        visible = [r.getMessage()[:30] for r in logs.records if r.levelno >= logging.INFO]
+        self.assertEqual(visible, ["Memory watermark critical! wor", "Scale-up cancelled on re-check"],
+                         logs.output[:5])
+        self.assertEqual(api.patches, [])
+        # Every tick samples 81% then re-checks 79%: 200 cancels, 1 visible line.
+        self.assertEqual(wd.metrics._counters['watchdog_blocked_total{reason="recheck"}'], 200)
+        # Clearly below the watermark: both episodes close with a summary.
+        seq[:] = [(int(0.5 * 2 * GIB), 2 * GIB)] * 2
+        with self.assertLogs("watchdog", level="INFO") as logs:
+            wd.tick()
+        self.assertEqual(sum("Episode over" in l for l in logs.output), 2, logs.output)
+        self.assertTrue(any("scale-up cancelled on re-check" in l and "199 repeats" in l
+                            for l in logs.output), logs.output)
+
+    def test_enodev_during_cgroup_teardown_is_treated_as_gone(self):
+        # While the kernel removes a cgroup, open() can succeed and read()
+        # fail with ENODEV instead of ENOENT; that must take the same quiet
+        # waiting path, not the generic ERROR path of the main loop.
+        def read(path):
+            raise OSError(errno.ENODEV, "No such device", path)
+
+        wd, api, clock = make_watchdog(read)
+        with self.assertLogs("watchdog", level="INFO") as logs:
+            for _ in range(5):
+                wd.tick()  # must not raise
+        self.assertEqual(sum("is gone" in l for l in logs.output), 1, logs.output)
+        self.assertEqual(wd.metrics._gauges["watchdog_target_present"], 0)
+        # Other OSErrors are still real errors and propagate.
+        wd2, _, _ = make_watchdog(lambda path: (_ for _ in ()).throw(PermissionError(errno.EACCES, "denied")))
+        with self.assertRaises(PermissionError):
+            wd2.tick()
+
+    def test_single_tick_episode_has_no_summary_line(self):
+        # Watermark crossed and rescued in the same tick (the normal drill
+        # outcome): the WARNING + TRIGGERING lines say it all; no
+        # "Episode over ... 0 repeats" filler.
+        wd, api, clock = make_watchdog(lambda path: (int(1.7 * GIB), 2 * GIB))
+        with self.assertLogs("watchdog", level="INFO") as logs:
+            wd.tick()
+        self.assertEqual(len(api.patches), 1)  # the rescue went out
+        self.assertFalse(any("Episode over" in l for l in logs.output), logs.output)
+
+    def test_episode_end_ratio_is_bounded(self):
+        wd, _, _ = make_watchdog(lambda path: (0, 2 * GIB))
+        self.assertAlmostEqual(wd._episode_end_ratio(), 0.70)          # default 0.8 - 0.1
+        wd.cfg.threshold = 0.10
+        self.assertAlmostEqual(wd._episode_end_ratio(), 0.05)          # not 0.0: episodes can end
+        wd.cfg.threshold = 0.05
+        self.assertAlmostEqual(wd._episode_end_ratio(), 0.025)
+
+    def test_log_level_env_parsing_is_strict(self):
+        self.assertEqual(watchdog.parse_log_level("debug"), logging.DEBUG)
+        self.assertEqual(watchdog.parse_log_level(" WARNING "), logging.WARNING)
+        self.assertEqual(watchdog.parse_log_level(None), logging.INFO)
+        # A logging-module attribute that is not a level must not leak through.
+        self.assertEqual(watchdog.parse_log_level("Handler"), logging.INFO)
+        self.assertEqual(watchdog.parse_log_level("verbose"), logging.INFO)
 
     def test_scale_up_adopts_inflight_scale_down_instead_of_shrinking(self):
         # Spec was shrunk to 2Gi (own pre-restart scale-down or an external

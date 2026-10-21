@@ -137,16 +137,17 @@ curl <pod-ip>:8090/metrics               # Prometheus metrics
 
 Implementation details and design reasoning for each item live in **[docs/design.md](docs/design.md)**.
 
-1. **Locating the cgroup**: at startup, finds the target container's cgroup directory via mountinfo or a POD_UID glob (private cgroup namespaces supported); relocates automatically after a main-container restart instead of going blind.
+1. **Locating the cgroup**: at startup, finds the target container's cgroup directory via mountinfo or a POD_UID glob (private cgroup namespaces supported); relocates automatically after a main-container restart instead of going blind. While the main container is crash-looping and no new cgroup appears, it **waits quietly** (one WARNING, `watchdog_target_present=0`, silent 2s retries) instead of erroring every poll and restarting itself.
 2. **Working-set accounting**: `memory.current − inactive_file`, matching the kubelet's OOM accounting — IO-heavy tasks don't trigger spurious scale-ups from inflated page cache.
 3. **Scale-up**: at working set ≥ 80% of limit, PATCHes `/resize` by one step, raising **requests and limits together** — borrowed memory always enters scheduling accounting, so the host and neighbor pods stay safe.
 4. **Host red line**: a scale-up passes only while `new limit + everything else on the host < 90% × physical memory`; short on space, the step degrades adaptively; no space at all trips a circuit breaker and alerts.
 5. **Failure handling**: Infeasible or a 60s timeout → roll back the spec + high-severity alert + a 10-minute circuit breaker. Never waits forever.
 6. **Scale-down**: only after the working set stays < 40% for 180s, stepping down gradually — a wide hysteresis band against the scale-up line; an in-flight scale-down is withdrawn immediately under new pressure, and external resizes are adopted and supervised, never overwritten.
 7. **Baseline persistence**: initial limit/requests are stored in pod annotations; a sidecar restart loses no bookkeeping.
-8. **Failing loudly**: when host memory info is unreadable, refuses to scale up and alerts continuously — never silently skips.
+8. **Failing loudly**: when host memory info is unreadable, refuses to scale up and alerts continuously — never silently skips. A missing target container is not an error; it takes the waiting state above.
 9. **Native sidecar**: starts before and terminates after the main container, covering the full lifecycle including very long graceful shutdowns; runs non-root with a read-only root filesystem and all capabilities dropped.
 10. **Observability**: Prometheus metrics + K8s Events + a heartbeat-driven `/healthz`; alerting is carried by the monitoring stack (7 PrometheusRules) — the watchdog only does second-level closed-loop handling and emits data points.
+11. **Log discipline**: two INFO lines at startup; conditions that repeat every sampling cycle (watermark critical, host exhausted, host stats unreadable, re-check cancelled, target gone) log once at full level and then at DEBUG until the episode ends with a single INFO summary. `WATCHDOG_LOG_LEVEL=DEBUG` restores the per-tick trail; metrics and K8s Events are unaffected.
 
 ## Deployment parameters (`values.yaml`)
 
@@ -161,6 +162,7 @@ worker:
     hostCeiling: 0.90        # host physical-memory red line
     allowBlindScaleup: false # allow a blind half-step scale-up when host memory info is unreadable
     metricsPort: 8090        # port for /metrics and /healthz
+    logLevel: "INFO"         # DEBUG shows the per-tick trail of repeating conditions
     repository: "registry.example.com/memory-watchdog"
     tag: "v1.8"
 ```
@@ -189,7 +191,8 @@ The full reasoning behind each item lives in **[docs/design.md](docs/design.md#k
 | Alert `MemoryWatchdogHostStatsUnreadable` | `/host/proc/meminfo` mount is broken, so the host safety check cannot run | Check the hostPath mount and node health; no scale-up is performed in this state and the container has no OOM rescue |
 | Alert `MemoryWatchdogHostMemoryExhausted` | The node as a whole is congested; no safe headroom | Add nodes; this is by-design protection |
 | Alert `MemoryWatchdogScaleUpBlockedAtCap` | Memory pressure persists but the cap (factor × baseline) is reached | If chronic, raise that tenant's baseline or maxMemoryFactor |
-| Alert `MemoryWatchdogSidecarRestarting` | Sidecar restarting repeatedly (prerequisites unmet / port taken / persistent main-loop errors / own OOM) | Read the container log's CRITICAL lines; meanwhile the target container's ceiling stays at baseline with no OOM rescue |
+| Alert `MemoryWatchdogSidecarRestarting` | Sidecar restarting repeatedly (prerequisites unmet / port taken / persistent main-loop errors / own OOM) | Read the container log's CRITICAL lines; meanwhile the target container's ceiling stays at baseline with no OOM rescue. In v0.1.0 a crash-looping main container also tripped this alert (100 failed cgroup reads, then self-exit); it no longer does |
+| Log WARNING `Target container ... is gone (restarting?)` (metric `watchdog_target_present=0`) | The main container is restarting / in CrashLoopBackOff | That is the main container's incident: read its logs and `kubectl describe pod`; the watchdog waits quietly and resumes automatically once the container is back |
 | Alert `MemoryWatchdogSpecReadErrors` | API server unreachable; scale decisions blocked | Check the API server / network; OOM rescue cannot run in this state |
 | Alert `MemoryWatchdogSelfMemoryHigh` | The watchdog's own memory is near its 100Mi limit | Check whether someone exec'ed a heavyweight diagnostic process; if a package upgrade raised the baseline, lift the limit to 128Mi |
 | The watchdog container itself OOMKilled (see the `last_terminated_reason` metric) | ~70Mi resident is a constant, so an OOMKill almost always means someone exec'ed a heavyweight diagnostic process, or a dependency upgrade raised the baseline | Check for in-container exec of kubernetes-importing scripts (forbidden); if a package upgrade raised the baseline, lift the limit to 128Mi and re-check the memory curve |
